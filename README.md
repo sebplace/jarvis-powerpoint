@@ -3,12 +3,16 @@
 Petite application Windows qui pilote le diaporama PowerPoint lorsque vous dites :
 
 - **« Jarvis, suivant ! »** pour avancer ;
-- **« Jarvis, précédent ! »** pour revenir en arrière.
+- **« Jarvis, précédent ! »** pour revenir en arrière ;
+- **« Jarvis, va au slide X ! »** pour atteindre directement la diapositive X
+  (de 1 à 999).
 
 Le mode anglais, sélectionnable depuis l'icône de notification, accepte :
 
 - **“Jarvis, next!”** pour avancer ;
-- **“Jarvis, previous!”** pour revenir en arrière.
+- **“Jarvis, previous!”** pour revenir en arrière ;
+- **“Jarvis, go to slide X!”** pour atteindre directement la diapositive X
+  (de 1 à 999).
 
 ## Télécharger
 
@@ -23,7 +27,7 @@ signé numériquement.
 
 1. Lancez `JarvisPowerPoint.exe`.
 2. Démarrez un diaporama dans PowerPoint.
-3. Dites « Jarvis, suivant ! » ou « Jarvis, précédent ! ».
+3. Prononcez l'une des commandes vocales ci-dessus.
 
 L'application reste dans la zone de notification Windows. Un clic droit sur son
 icône permet de mettre l'écoute en pause, de tester la commande PowerPoint ou de
