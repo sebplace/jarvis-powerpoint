@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Speech.Recognition;
+using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Office = Microsoft.Office.Core;
@@ -16,7 +17,7 @@ using PowerPoint = Microsoft.Office.Interop.PowerPoint;
 [assembly: AssemblyDescription("Commande vocale locale pour avancer un diaporama PowerPoint")]
 [assembly: AssemblyCompany("Jarvis PowerPoint")]
 [assembly: AssemblyProduct("Jarvis PowerPoint")]
-[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
 
 namespace JarvisPowerPoint
 {
@@ -44,6 +45,18 @@ namespace JarvisPowerPoint
                 string message = "Numéro de diapositive invalide.";
                 bool succeeded = int.TryParse(args[1], out slideNumber) &&
                     PowerPointController.TryGoToSlide(slideNumber, out message);
+                Console.WriteLine(message);
+                Environment.ExitCode = succeeded ? 0 : 1;
+                return;
+            }
+
+            if (args.Length >= 2 && args[0].Equals("--search", StringComparison.OrdinalIgnoreCase))
+            {
+                string message;
+                bool succeeded = PowerPointController.TryFindAndGoToSlide(
+                    string.Join(" ", args.Skip(1).ToArray()),
+                    false,
+                    out message);
                 Console.WriteLine(message);
                 Environment.ExitCode = succeeded ? 0 : 1;
                 return;
@@ -142,9 +155,11 @@ namespace JarvisPowerPoint
                 previousCommand.Append(currentCultureName == "en-US" ? "previous" : "précédent");
 
                 Grammar goToGrammar = CreateGoToGrammar(recognizerInfo.Culture);
+                Grammar searchGrammar = CreateSearchGrammar(recognizerInfo.Culture);
                 recognizer.LoadGrammar(new Grammar(nextCommand) { Name = "JarvisNext" });
                 recognizer.LoadGrammar(new Grammar(previousCommand) { Name = "JarvisPrevious" });
                 recognizer.LoadGrammar(goToGrammar);
+                recognizer.LoadGrammar(searchGrammar);
                 recognizer.SetInputToDefaultAudioDevice();
                 recognizer.SpeechRecognized += OnSpeechRecognized;
                 recognizer.RecognizeCompleted += OnRecognitionCompleted;
@@ -190,6 +205,18 @@ namespace JarvisPowerPoint
                     new Choices(slideNumbers.ToArray())));
 
             return new Grammar(command) { Name = "JarvisGoToSlide" };
+        }
+
+        private Grammar CreateSearchGrammar(CultureInfo culture)
+        {
+            var command = new GrammarBuilder { Culture = culture };
+            command.Append("Jarvis");
+            command.Append(
+                culture.Name == "en-US"
+                    ? new Choices("search for", "find", "go to the slide about")
+                    : new Choices("cherche", "trouve", "va au slide sur", "vas au slide sur"));
+            command.AppendDictation();
+            return new Grammar(command) { Name = "JarvisSearch" };
         }
 
         private void ChangeLanguage(object sender, EventArgs eventArgs)
@@ -250,6 +277,16 @@ namespace JarvisPowerPoint
                     CultureInfo.InvariantCulture);
                 succeeded = PowerPointController.TryGoToSlide(slideNumber, out message);
             }
+            else if (eventArgs.Result.Grammar.Name == "JarvisSearch")
+            {
+                string query = ExtractSearchQuery(eventArgs.Result.Text);
+                succeeded = PowerPointController.TryFindAndGoToSlide(
+                    query,
+                    currentCultureName == "en-US",
+                    out message);
+                ShowNotification(succeeded ? "Diapositive trouvée" : "Aucun résultat", message);
+                return;
+            }
             else
             {
                 succeeded = eventArgs.Result.Grammar.Name == "JarvisPrevious"
@@ -261,6 +298,23 @@ namespace JarvisPowerPoint
             {
                 ShowNotification("Commande entendue", message);
             }
+        }
+
+        private string ExtractSearchQuery(string recognizedText)
+        {
+            string[] prefixes = currentCultureName == "en-US"
+                ? new[] { "Jarvis go to the slide about ", "Jarvis search for ", "Jarvis find " }
+                : new[]
+                {
+                    "Jarvis va au slide sur ",
+                    "Jarvis vas au slide sur ",
+                    "Jarvis cherche ",
+                    "Jarvis trouve "
+                };
+
+            string prefix = prefixes.FirstOrDefault(
+                value => recognizedText.StartsWith(value, StringComparison.CurrentCultureIgnoreCase));
+            return prefix == null ? string.Empty : recognizedText.Substring(prefix.Length).Trim();
         }
 
         private void ToggleListening(object sender, EventArgs eventArgs)
@@ -371,8 +425,8 @@ namespace JarvisPowerPoint
         private string GetCommandHelp()
         {
             return currentCultureName == "en-US"
-                ? "Say “Jarvis, next!”, “previous!” or “go to slide X!” during your slide show."
-                : "Dites « Jarvis, suivant ! », « précédent ! » ou « va au slide X ! ».";
+                ? "Say “Jarvis, next!”, “go to slide X!” or “search for X!”."
+                : "Dites « Jarvis, suivant ! », « va au slide X ! » ou « cherche X ! ».";
         }
 
         private static string LoadPreferredCulture()
@@ -574,6 +628,14 @@ namespace JarvisPowerPoint
 
     internal static class PowerPointController
     {
+        private static readonly HashSet<string> SearchStopWords = new HashSet<string>(
+            new[]
+            {
+                "a", "about", "an", "and", "au", "aux", "de", "des", "du", "et",
+                "for", "la", "le", "les", "of", "on", "sur", "the", "un", "une"
+            },
+            StringComparer.Ordinal);
+
         public static bool TryAdvanceSlide(out string message)
         {
             return TryMoveSlide(true, out message);
@@ -641,6 +703,399 @@ namespace JarvisPowerPoint
             }
         }
 
+        public static bool TryFindAndGoToSlide(string query, bool useEnglish, out string message)
+        {
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                message = useEnglish ? "I did not understand what to search for." : "Je n’ai pas compris quoi chercher.";
+                return false;
+            }
+
+            PowerPoint.Application application = null;
+            PowerPoint.SlideShowWindows slideShowWindows = null;
+            PowerPoint.SlideShowWindow slideShowWindow = null;
+            PowerPoint.SlideShowView view = null;
+            PowerPoint.Presentation presentation = null;
+            PowerPoint.Slides slides = null;
+
+            try
+            {
+                application = (PowerPoint.Application)Marshal.GetActiveObject("PowerPoint.Application");
+                slideShowWindows = application.SlideShowWindows;
+                if (slideShowWindows.Count == 0)
+                {
+                    message = useEnglish
+                        ? "PowerPoint is open, but no slide show is running."
+                        : "PowerPoint est ouvert, mais aucun diaporama n’est en cours.";
+                    return false;
+                }
+
+                slideShowWindow = slideShowWindows[1];
+                presentation = slideShowWindow.Presentation;
+                slides = presentation.Slides;
+                List<SlideSearchResult> results = FindSlides(slides, query);
+                if (results.Count == 0)
+                {
+                    message = useEnglish
+                        ? string.Format(CultureInfo.CurrentCulture, "No slide contains “{0}”.", query)
+                        : string.Format(CultureInfo.CurrentCulture, "Aucune diapositive ne contient « {0} ».", query);
+                    return false;
+                }
+
+                SlideSearchResult bestResult = results[0];
+                view = slideShowWindow.View;
+                view.GotoSlide(bestResult.SlideNumber, Office.MsoTriState.msoFalse);
+
+                string title = string.IsNullOrWhiteSpace(bestResult.Title)
+                    ? string.Empty
+                    : " — " + bestResult.Title;
+                message = useEnglish
+                    ? string.Format(
+                        CultureInfo.CurrentCulture,
+                        "Slide {0}{1}{2}",
+                        bestResult.SlideNumber,
+                        title,
+                        results.Count > 1
+                            ? string.Format(CultureInfo.CurrentCulture, " ({0} matches)", results.Count)
+                            : string.Empty)
+                    : string.Format(
+                        CultureInfo.CurrentCulture,
+                        "Diapositive {0}{1}{2}",
+                        bestResult.SlideNumber,
+                        title,
+                        results.Count > 1
+                            ? string.Format(CultureInfo.CurrentCulture, " ({0} résultats)", results.Count)
+                            : string.Empty);
+                return true;
+            }
+            catch (COMException)
+            {
+                message = useEnglish
+                    ? "Open PowerPoint and start the slide show."
+                    : "Ouvrez PowerPoint et démarrez le diaporama.";
+                return false;
+            }
+            finally
+            {
+                ReleaseComObject(slides);
+                ReleaseComObject(presentation);
+                ReleaseComObject(view);
+                ReleaseComObject(slideShowWindow);
+                ReleaseComObject(slideShowWindows);
+                ReleaseComObject(application);
+            }
+        }
+
+        private static List<SlideSearchResult> FindSlides(PowerPoint.Slides slides, string query)
+        {
+            string normalizedQuery = NormalizeForSearch(query);
+            string[] queryWords = normalizedQuery
+                .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)
+                .Where(word => !SearchStopWords.Contains(word))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            if (queryWords.Length == 0)
+            {
+                queryWords = normalizedQuery
+                    .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            }
+            var results = new List<SlideSearchResult>();
+
+            for (int index = 1; index <= slides.Count; index++)
+            {
+                PowerPoint.Slide slide = null;
+                try
+                {
+                    slide = slides[index];
+                    string title = GetSlideTitle(slide);
+                    string content = GetSlideText(slide);
+                    int score = ScoreSlide(title, content, normalizedQuery, queryWords);
+                    if (score > 0)
+                    {
+                        results.Add(new SlideSearchResult(index, title, score));
+                    }
+                }
+                finally
+                {
+                    ReleaseComObject(slide);
+                }
+            }
+
+            return results
+                .OrderByDescending(result => result.Score)
+                .ThenBy(result => result.SlideNumber)
+                .ToList();
+        }
+
+        private static string GetSlideTitle(PowerPoint.Slide slide)
+        {
+            PowerPoint.Shapes shapes = null;
+            PowerPoint.Shape titleShape = null;
+            PowerPoint.TextFrame textFrame = null;
+            PowerPoint.TextRange textRange = null;
+
+            try
+            {
+                shapes = slide.Shapes;
+                if (shapes.HasTitle != Office.MsoTriState.msoTrue)
+                {
+                    return string.Empty;
+                }
+
+                titleShape = shapes.Title;
+                if (titleShape.HasTextFrame != Office.MsoTriState.msoTrue)
+                {
+                    return string.Empty;
+                }
+
+                textFrame = titleShape.TextFrame;
+                if (textFrame.HasText != Office.MsoTriState.msoTrue)
+                {
+                    return string.Empty;
+                }
+
+                textRange = textFrame.TextRange;
+                string title = CleanDisplayText(textRange.Text);
+                return title.Length <= 80 ? title : title.Substring(0, 77) + "...";
+            }
+            finally
+            {
+                ReleaseComObject(textRange);
+                ReleaseComObject(textFrame);
+                ReleaseComObject(titleShape);
+                ReleaseComObject(shapes);
+            }
+        }
+
+        private static string GetSlideText(PowerPoint.Slide slide)
+        {
+            PowerPoint.Shapes shapes = null;
+            var text = new StringBuilder();
+
+            try
+            {
+                shapes = slide.Shapes;
+                for (int index = 1; index <= shapes.Count; index++)
+                {
+                    PowerPoint.Shape shape = null;
+                    try
+                    {
+                        shape = shapes[index];
+                        AppendShapeText(shape, text);
+                    }
+                    finally
+                    {
+                        ReleaseComObject(shape);
+                    }
+                }
+            }
+            finally
+            {
+                ReleaseComObject(shapes);
+            }
+
+            return text.ToString();
+        }
+
+        private static void AppendShapeText(PowerPoint.Shape shape, StringBuilder text)
+        {
+            if (shape.Type == Office.MsoShapeType.msoGroup)
+            {
+                PowerPoint.GroupShapes groupItems = null;
+                try
+                {
+                    groupItems = shape.GroupItems;
+                    for (int index = 1; index <= groupItems.Count; index++)
+                    {
+                        PowerPoint.Shape groupShape = null;
+                        try
+                        {
+                            groupShape = (PowerPoint.Shape)groupItems[index];
+                            AppendShapeText(groupShape, text);
+                        }
+                        finally
+                        {
+                            ReleaseComObject(groupShape);
+                        }
+                    }
+                }
+                finally
+                {
+                    ReleaseComObject(groupItems);
+                }
+            }
+
+            if (shape.HasTextFrame == Office.MsoTriState.msoTrue)
+            {
+                PowerPoint.TextFrame textFrame = null;
+                PowerPoint.TextRange textRange = null;
+                try
+                {
+                    textFrame = shape.TextFrame;
+                    if (textFrame.HasText == Office.MsoTriState.msoTrue)
+                    {
+                        textRange = textFrame.TextRange;
+                        text.Append(' ').Append(textRange.Text);
+                    }
+                }
+                finally
+                {
+                    ReleaseComObject(textRange);
+                    ReleaseComObject(textFrame);
+                }
+            }
+
+            if (shape.HasTable == Office.MsoTriState.msoTrue)
+            {
+                AppendTableText(shape, text);
+            }
+
+            if (!string.IsNullOrWhiteSpace(shape.AlternativeText))
+            {
+                text.Append(' ').Append(shape.AlternativeText);
+            }
+        }
+
+        private static void AppendTableText(PowerPoint.Shape shape, StringBuilder text)
+        {
+            PowerPoint.Table table = null;
+            PowerPoint.Rows rows = null;
+            PowerPoint.Columns columns = null;
+
+            try
+            {
+                table = shape.Table;
+                rows = table.Rows;
+                columns = table.Columns;
+                for (int row = 1; row <= rows.Count; row++)
+                {
+                    for (int column = 1; column <= columns.Count; column++)
+                    {
+                        PowerPoint.Cell cell = null;
+                        PowerPoint.Shape cellShape = null;
+                        PowerPoint.TextFrame textFrame = null;
+                        PowerPoint.TextRange textRange = null;
+                        try
+                        {
+                            cell = table.Cell(row, column);
+                            cellShape = cell.Shape;
+                            textFrame = cellShape.TextFrame;
+                            if (textFrame.HasText == Office.MsoTriState.msoTrue)
+                            {
+                                textRange = textFrame.TextRange;
+                                text.Append(' ').Append(textRange.Text);
+                            }
+                        }
+                        finally
+                        {
+                            ReleaseComObject(textRange);
+                            ReleaseComObject(textFrame);
+                            ReleaseComObject(cellShape);
+                            ReleaseComObject(cell);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                ReleaseComObject(columns);
+                ReleaseComObject(rows);
+                ReleaseComObject(table);
+            }
+        }
+
+        private static int ScoreSlide(
+            string title,
+            string content,
+            string normalizedQuery,
+            string[] queryWords)
+        {
+            string normalizedTitle = NormalizeForSearch(title);
+            string normalizedContent = NormalizeForSearch(content);
+
+            if (normalizedTitle == normalizedQuery)
+            {
+                return 1000;
+            }
+
+            if (ContainsPhrase(normalizedTitle, normalizedQuery))
+            {
+                return 800;
+            }
+
+            if (ContainsPhrase(normalizedContent, normalizedQuery))
+            {
+                return 500;
+            }
+
+            int titleMatches = queryWords.Count(word => ContainsWord(normalizedTitle, word));
+            int contentMatches = queryWords.Count(word => ContainsWord(normalizedContent, word));
+            if (titleMatches == 0 && contentMatches == 0)
+            {
+                return 0;
+            }
+
+            return (titleMatches * 100) + (contentMatches * 20);
+        }
+
+        private static bool ContainsPhrase(string text, string phrase)
+        {
+            return !string.IsNullOrEmpty(phrase) &&
+                (" " + text + " ").Contains(" " + phrase + " ");
+        }
+
+        private static bool ContainsWord(string text, string word)
+        {
+            return !string.IsNullOrEmpty(word) &&
+                (" " + text + " ").Contains(" " + word + " ");
+        }
+
+        private static string NormalizeForSearch(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            string decomposed = value.Normalize(NormalizationForm.FormD);
+            var normalized = new StringBuilder(decomposed.Length);
+            bool previousWasSpace = true;
+
+            foreach (char character in decomposed)
+            {
+                UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(character);
+                if (category == UnicodeCategory.NonSpacingMark)
+                {
+                    continue;
+                }
+
+                if (char.IsLetterOrDigit(character))
+                {
+                    normalized.Append(char.ToLowerInvariant(character));
+                    previousWasSpace = false;
+                }
+                else if (!previousWasSpace)
+                {
+                    normalized.Append(' ');
+                    previousWasSpace = true;
+                }
+            }
+
+            return normalized.ToString().Trim();
+        }
+
+        private static string CleanDisplayText(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            return string.Join(
+                " ",
+                value.Split((char[])null, StringSplitOptions.RemoveEmptyEntries));
+        }
+
         private static bool TryMoveSlide(bool moveForward, out string message)
         {
             PowerPoint.Application application = null;
@@ -693,6 +1148,22 @@ namespace JarvisPowerPoint
             {
                 Marshal.FinalReleaseComObject(value);
             }
+        }
+
+        internal sealed class SlideSearchResult
+        {
+            public SlideSearchResult(int slideNumber, string title, int score)
+            {
+                SlideNumber = slideNumber;
+                Title = title;
+                Score = score;
+            }
+
+            public int SlideNumber { get; private set; }
+
+            public string Title { get; private set; }
+
+            public int Score { get; private set; }
         }
     }
 }

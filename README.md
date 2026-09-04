@@ -5,14 +5,18 @@ Petite application Windows qui pilote le diaporama PowerPoint lorsque vous dites
 - **« Jarvis, suivant ! »** pour avancer ;
 - **« Jarvis, précédent ! »** pour revenir en arrière ;
 - **« Jarvis, va au slide X ! »** pour atteindre directement la diapositive X
-  (de 1 à 999).
+  (de 1 à 999) ;
+- **« Jarvis, cherche budget »** ou **« Jarvis, va au slide sur la sécurité »**
+  pour rechercher un titre ou du texte visible.
 
 Le mode anglais, sélectionnable depuis l'icône de notification, accepte :
 
 - **“Jarvis, next!”** pour avancer ;
 - **“Jarvis, previous!”** pour revenir en arrière ;
 - **“Jarvis, go to slide X!”** pour atteindre directement la diapositive X
-  (de 1 à 999).
+  (de 1 à 999) ;
+- **“Jarvis, search for budget”** ou **“Jarvis, go to the slide about security”**
+  pour rechercher un titre ou du texte visible.
 
 ## Télécharger
 
@@ -36,6 +40,9 @@ active ou suspend aussi l'écoute.
 
 La reconnaissance vocale reste entièrement locale. Aucune donnée audio n'est
 envoyée vers un service en ligne.
+
+La recherche ignore les majuscules et les accents. Les titres sont prioritaires
+sur le reste du contenu. Le texte intégré dans une image n'est pas indexé.
 
 ## Prérequis
 
