@@ -1,9 +1,9 @@
 [CmdletBinding()]
-param()
+param([string]$Executable = (Join-Path (Split-Path -Parent $PSScriptRoot) "bin\JarvisPowerPoint.exe"))
 
 $ErrorActionPreference = "Stop"
 $projectDirectory = Split-Path -Parent $PSScriptRoot
-$executable = Join-Path $projectDirectory "bin\JarvisPowerPoint.exe"
+$executable = [IO.Path]::GetFullPath($Executable)
 $assembly = [Reflection.Assembly]::LoadFrom($executable)
 $shortcutType = $assembly.GetType("JarvisPowerPoint.StartMenuShortcut", $true)
 $id = [Guid]::NewGuid().ToString("N")

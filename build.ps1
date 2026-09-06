@@ -1,12 +1,17 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$OutputDirectory
+)
 
 $ErrorActionPreference = "Stop"
 $projectDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
-$outputDirectory = Join-Path $projectDirectory "bin"
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = Join-Path $projectDirectory "bin"
+}
+$outputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $outputPath = Join-Path $outputDirectory "JarvisPowerPoint.exe"
-$sourcePath = Join-Path $projectDirectory "JarvisPowerPoint.cs"
-$shortcutSourcePath = Join-Path $projectDirectory "StartMenuShortcut.cs"
+$sourcePaths = Get-ChildItem -LiteralPath $projectDirectory -Filter "*.cs" |
+    Select-Object -ExpandProperty FullName
 
 $compilerCandidates = @(
     "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
@@ -54,12 +59,13 @@ New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
     /reference:System.dll `
     /reference:System.Core.dll `
     /reference:System.Drawing.dll `
+    /reference:System.Xml.dll `
+    /reference:System.Xml.Linq.dll `
     "/reference:$speechAssembly" `
     /reference:System.Windows.Forms.dll `
     "/reference:$officeInterop" `
     "/reference:$powerPointInterop" `
-    $sourcePath `
-    $shortcutSourcePath
+    $sourcePaths
 
 if ($LASTEXITCODE -ne 0) {
     throw "La compilation a échoué avec le code $LASTEXITCODE."

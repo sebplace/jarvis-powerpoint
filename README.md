@@ -45,13 +45,87 @@ signé numériquement.
 ## Utilisation
 
 1. Lancez `JarvisPowerPoint.exe`.
-2. Démarrez un diaporama dans PowerPoint.
-3. Prononcez l'une des commandes vocales ci-dessus.
+2. Dans l'assistant initial, choisissez la langue et le microphone. Le bouton de
+   test permet de prononcer **« Jarvis test »** sans agir sur PowerPoint. Le test
+   reste facultatif ; enregistrez les réglages pour terminer.
+3. Démarrez un seul diaporama dans PowerPoint.
+4. Prononcez l'une des commandes vocales ci-dessus.
 
 L'application reste dans la zone de notification Windows. Un clic droit sur son
 icône permet de mettre l'écoute en pause, de tester la commande PowerPoint ou de
 choisir **Français / English**. Le choix de langue est mémorisé. Un double-clic
 active ou suspend aussi l'écoute.
+
+Les réglages sont accessibles à tout moment via **Langue et microphone...**.
+La sélection du microphone ne modifie pas le périphérique par défaut des autres
+applications Windows. Si un microphone choisi n'est plus disponible, Jarvis le
+signale : sélectionnez-le à nouveau ou choisissez le microphone Windows par défaut.
+Mettre l'écoute en pause libère le microphone utilisé par Jarvis.
+
+## Rechercher, répondre, puis reprendre
+
+| Français | English | Action |
+|---|---|---|
+| Jarvis, reprends la présentation | Jarvis, resume the presentation | Revenir au point mémorisé |
+| Jarvis, autre résultat | Jarvis, another result | Parcourir les résultats de la dernière recherche |
+| Jarvis, mode questions | Jarvis, questions mode | Mémoriser la position avant les questions-réponses |
+| Jarvis, écran noir | Jarvis, black screen | Masquer temporairement les slides |
+| Jarvis, affiche | Jarvis, restore slides | Réafficher le diaporama |
+| Jarvis, raccourci la démo | Jarvis, shortcut the demo | Ouvrir un alias personnel |
+| Jarvis, démarre la répétition | Jarvis, start rehearsal | Démarrer le chronométrage |
+| Jarvis, arrête la répétition | Jarvis, stop rehearsal | Arrêter et conserver le bilan en mémoire |
+
+Un saut par recherche, numéro ou alias mémorise le point de départ. Les sauts
+suivants ne l'écrasent pas : dites **« Jarvis, reprends »** pour revenir, puis
+continuer normalement. Le mode questions permet de poser ce repère avant même
+de naviguer. La reprise réussie efface le repère et les résultats de recherche.
+Le repère appartient au diaporama courant, pas à toutes les présentations.
+
+**Autre résultat** parcourt les correspondances dans l'ordre du classement,
+puis revient au premier résultat. Les références utilisent l'identifiant des
+diapositives pour résister à leur réorganisation. Une diapositive supprimée ne
+doit pas vous envoyer sur une autre par erreur. Une recherche sans résultat ne
+déplace pas le diaporama.
+
+## Outils présentateur
+
+Clic droit sur l'icône Jarvis, puis **Outils présentateur...** :
+
+- **Présentateur** : état du microphone, niveau sonore, dernière commande
+  comprise et résultat de son exécution ; boutons de reprise, questions,
+  résultats et écran noir.
+- **Alias de slides** : associez un nom au slide courant d'une présentation
+  enregistrée. Le même nom met à jour l'association ; sélectionnez un alias
+  pour le supprimer ou le tester. Il est propre à cette présentation.
+- **Répétition** : chronométrage cumulé par slide, budget par défaut de
+  90 secondes, dépassements affichés en rouge. Sélectionnez une ligne pour
+  lui appliquer un budget différent. Les retours sur un slide cumulent le temps.
+
+L'indicateur compact est **désactivé par défaut**. Activez-le dans le panneau et
+choisissez explicitement l'écran sur lequel l'afficher. Il ne vole pas le focus
+au diaporama. Fermer le panneau le masque sans quitter Jarvis.
+
+**Attention au partage d'écran :** le panneau et l'indicateur sont des fenêtres
+Windows visibles, pas une zone protégée. Placez-les sur votre écran présentateur
+et partagez uniquement la fenêtre du diaporama. Ils seront visibles si vous
+partagez tout l'écran qui les contient.
+
+## Répétition et données locales
+
+Le chronométrage suit également les changements de slide effectués au clavier
+ou à la souris (échantillonnage toutes les 500 ms). Le temps passé en écran noir
+est exclu. La fin ou le changement de diaporama arrête la répétition. Une
+nouvelle répétition remplace le bilan précédent.
+
+Le bilan reste en mémoire jusqu'à la fermeture de Jarvis. Le bouton **Exporter
+CSV...** permet de l'enregistrer dans un fichier choisi : titre de présentation,
+numéro et titre de slide, temps, budget et dépassement. Aucun audio n'est enregistré.
+
+Les alias sont enregistrés sous `%LOCALAPPDATA%\JarvisPowerPoint`, sans modifier
+le fichier PowerPoint. Leur association dépend de l'emplacement du fichier :
+après un déplacement ou un renommage de la présentation, recréez ses alias.
+La langue et le microphone sont mémorisés dans
+`HKEY_CURRENT_USER\Software\JarvisPowerPoint`.
 
 La reconnaissance vocale reste entièrement locale. Aucune donnée audio n'est
 envoyée vers un service en ligne.
@@ -81,6 +155,12 @@ Dans Windows PowerShell :
 
 Le script utilise le compilateur .NET Framework déjà inclus dans Windows et ne
 nécessite aucun SDK supplémentaire.
+
+Pour compiler sans remplacer l'exécutable en cours d'utilisation :
+
+```powershell
+.\build.ps1 -OutputDirectory .\bin\candidate
+```
 
 ## Licence
 
