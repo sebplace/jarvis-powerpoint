@@ -24,6 +24,21 @@ Téléchargez `JarvisPowerPoint.exe` depuis la
 [dernière version publiée](https://github.com/sebplace/jarvis-powerpoint/releases/latest).
 Aucune installation n'est nécessaire.
 
+Placez l'exécutable dans un dossier où vous souhaitez le conserver avant de le
+lancer. Au premier lancement, Jarvis propose de créer un raccourci dans votre
+menu Démarrer, sans droits administrateur. Acceptez pour retrouver ensuite
+l'application en appuyant sur **Windows** et en tapant **Jarvis PowerPoint**.
+
+Si vous refusez, la proposition ne se répète pas aux lancements suivants. Vous
+pouvez créer le raccourci plus tard avec un clic droit sur l'icône Jarvis près de
+l'horloge, puis **Créer / actualiser le raccourci Démarrer...**. Un raccourci déjà
+présent est conservé, sans nouvelle demande au démarrage.
+
+L'application reste portable : le raccourci pointe vers l'exécutable, il ne le
+copie pas et n'active pas le démarrage automatique avec Windows. Si vous déplacez
+l'exécutable, relancez-le depuis son nouveau dossier et actualisez le raccourci
+depuis ce même menu. Si vous supprimez Jarvis, supprimez aussi son raccourci.
+
 Windows peut afficher un avertissement SmartScreen, car l'exécutable n'est pas
 signé numériquement.
 

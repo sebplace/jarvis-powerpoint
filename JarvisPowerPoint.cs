@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -17,7 +18,7 @@ using PowerPoint = Microsoft.Office.Interop.PowerPoint;
 [assembly: AssemblyDescription("Commande vocale locale pour avancer un diaporama PowerPoint")]
 [assembly: AssemblyCompany("Jarvis PowerPoint")]
 [assembly: AssemblyProduct("Jarvis PowerPoint")]
-[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
 
 namespace JarvisPowerPoint
 {
@@ -78,6 +79,7 @@ namespace JarvisPowerPoint
         private readonly ToolStripMenuItem toggleItem;
         private readonly ToolStripMenuItem frenchLanguageItem;
         private readonly ToolStripMenuItem englishLanguageItem;
+        private readonly ToolStripMenuItem shortcutItem;
         private SpeechRecognitionEngine recognizer;
         private DateTime lastCommandUtc = DateTime.MinValue;
         private string currentCultureName;
@@ -99,6 +101,12 @@ namespace JarvisPowerPoint
             {
                 Tag = "en-US"
             };
+            shortcutItem = new ToolStripMenuItem(
+                currentCultureName == "en-US"
+                    ? "Create / update Start menu shortcut..."
+                    : "Créer / actualiser le raccourci Démarrer...",
+                null,
+                delegate { ConfigureStartMenuShortcut(true); });
 
             var languageMenu = new ToolStripMenuItem("Langue");
             languageMenu.DropDownItems.Add(frenchLanguageItem);
@@ -112,6 +120,7 @@ namespace JarvisPowerPoint
             menu.Items.Add(new ToolStripMenuItem("Tester « suivant »", null, TestNextSlide));
             menu.Items.Add(new ToolStripMenuItem("Tester « précédent »", null, TestPreviousSlide));
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(shortcutItem);
             menu.Items.Add(new ToolStripMenuItem("Quitter", null, ExitApplication));
 
             notifyIcon = new NotifyIcon
@@ -123,7 +132,78 @@ namespace JarvisPowerPoint
             };
             notifyIcon.DoubleClick += ToggleListening;
 
+            ConfigureStartMenuShortcut(false);
             InitializeSpeechRecognition();
+        }
+
+        private void ConfigureStartMenuShortcut(bool fromMenu)
+        {
+            bool english = currentCultureName == "en-US";
+            try
+            {
+                var shortcut = new StartMenuShortcut(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Programs),
+                    Application.ExecutablePath,
+                    @"HKEY_CURRENT_USER\Software\JarvisPowerPoint");
+
+                ShortcutResult result = shortcut.Configure(
+                    delegate
+                    {
+                        string question = english
+                            ? "Create or update a Start menu shortcut for Jarvis PowerPoint?"
+                                + "\n\nYou can then find it by pressing Windows and typing Jarvis PowerPoint."
+                                + "\nNo administrator rights are needed. This does not start Jarvis with Windows."
+                                + "\n\nKeep the executable in this location:"
+                            : "Créer ou actualiser un raccourci Jarvis PowerPoint dans le menu Démarrer ?"
+                                + "\n\nVous pourrez le retrouver avec la touche Windows en tapant Jarvis PowerPoint."
+                                + "\nAucun droit administrateur requis. Jarvis ne démarrera pas avec Windows."
+                                + "\n\nConservez l’exécutable à cet emplacement :";
+                        question += "\n" + Application.ExecutablePath;
+                        question += english
+                            ? "\n\nYou can do this later from the Jarvis tray menu."
+                            : "\n\nVous pourrez le faire plus tard depuis le menu de l’icône Jarvis.";
+                        return MessageBox.Show(
+                            question, "Jarvis PowerPoint", MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+                    },
+                    fromMenu);
+
+                if (result == ShortcutResult.Created)
+                {
+                    MessageBox.Show(
+                        english
+                            ? "Shortcut saved. Press Windows and search for Jarvis PowerPoint."
+                            : "Raccourci enregistré. Appuyez sur Windows et cherchez Jarvis PowerPoint.",
+                        "Jarvis PowerPoint", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+            catch (IOException exception)
+            {
+                ShowShortcutError(english, exception.Message);
+            }
+            catch (UnauthorizedAccessException exception)
+            {
+                ShowShortcutError(english, exception.Message);
+            }
+            catch (SecurityException exception)
+            {
+                ShowShortcutError(english, exception.Message);
+            }
+            catch (COMException exception)
+            {
+                ShowShortcutError(english, exception.Message);
+            }
+        }
+
+        private static void ShowShortcutError(bool english, string details)
+        {
+            MessageBox.Show(
+                (english
+                    ? "Could not complete Start menu setup. Jarvis will continue to run."
+                        + "\nRetry from the Jarvis tray menu.\n\n"
+                    : "La configuration du raccourci n’a pas pu être terminée. Jarvis reste utilisable."
+                        + "\nRéessayez depuis le menu de l’icône Jarvis.\n\n") + details,
+                "Jarvis PowerPoint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private void InitializeSpeechRecognition()
@@ -420,6 +500,9 @@ namespace JarvisPowerPoint
         {
             frenchLanguageItem.Checked = currentCultureName == "fr-FR";
             englishLanguageItem.Checked = currentCultureName == "en-US";
+            shortcutItem.Text = currentCultureName == "en-US"
+                ? "Create / update Start menu shortcut..."
+                : "Créer / actualiser le raccourci Démarrer...";
         }
 
         private string GetCommandHelp()
