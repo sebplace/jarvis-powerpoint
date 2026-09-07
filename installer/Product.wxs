@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="$(var.ProductCode)" Name="Jarvis PowerPoint" Language="1033"
+           Version="$(var.ProductVersion)" Manufacturer="sebplace"
+           UpgradeCode="$(var.UpgradeCode)">
+    <Package Id="*" InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             InstallPrivileges="elevated" Platform="x86"
+             Description="Jarvis PowerPoint managed installation" />
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer Jarvis PowerPoint version is already installed. Contact IT."
+                  AllowSameVersionUpgrades="no" MigrateFeatures="yes" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPCOMMENTS" Value="Managed deployment. IT must service this installation with MSI." />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/sebplace/jarvis-powerpoint" />
+    <Property Id="ARPPRODUCTICON" Value="JarvisIcon" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="REBOOT" Value="ReallySuppress" />
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <Property Id="MSIDISABLERMRESTART" Value="1" />
+    <Property Id="NETFRAMEWORK48" Secure="yes">
+      <RegistrySearch Id="Framework48Release" Root="HKLM"
+                      Key="SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"
+                      Name="Release" Type="raw" Win64="no" />
+    </Property>
+    <Condition Message="Jarvis requires .NET Framework 4.8 or later. Ask IT to enable it, then retry. PowerPoint is needed only at runtime.">
+      Installed OR (NETFRAMEWORK48 AND NETFRAMEWORK48 &gt;= "#528040")
+    </Condition>
+    <Condition Message="This is an all-users managed package. A per-user installation is not supported.">
+      ALLUSERS = 1
+    </Condition>
+
+    <Icon Id="JarvisIcon" SourceFile="$(var.ExecutablePath)" />
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="JarvisInstallFolder" Name="Jarvis PowerPoint">
+          <Component Id="Application" Guid="{DA5850D0-303C-44AE-950D-E9753368425E}" Win64="no">
+            <RemoveFolder Id="RemoveEmptyInstallFolder" On="uninstall" />
+            <File Id="JarvisExe" Name="JarvisPowerPoint.exe" Source="$(var.ExecutablePath)" KeyPath="yes">
+              <Shortcut Id="JarvisStartMenu" Directory="ProgramMenuFolder" Name="Jarvis PowerPoint"
+                        Description="Jarvis PowerPoint - Voice control for slide shows"
+                        WorkingDirectory="JarvisInstallFolder" Advertise="yes"
+                        Icon="JarvisIcon" IconIndex="0" />
+            </File>
+          </Component>
+          <Component Id="ManagedMarker" Guid="{59DC704B-D5C4-44AE-9B1B-4FA1C5FE5180}" Win64="no">
+            <File Id="ManagedMarkerFile" Name="JarvisPowerPoint.managed"
+                  Source="$(var.SourceDirectory)\installer\JarvisPowerPoint.managed" KeyPath="yes" />
+          </Component>
+          <Component Id="License" Guid="{A6489E20-CF1F-4B97-8FE7-72CD7E19B9E9}" Win64="no">
+            <File Id="LicenseFile" Name="LICENSE" Source="$(var.SourceDirectory)\LICENSE" KeyPath="yes" />
+          </Component>
+          <Component Id="DeploymentRegistration" Guid="{3B5E3D62-DF4A-46EB-B66F-4A8B869C94A9}" Win64="no">
+            <RegistryValue Root="HKLM" Key="Software\JarvisPowerPoint\Deployment"
+                           Name="InstallPath" Value="[JarvisInstallFolder]" Type="string" KeyPath="yes" />
+            <RegistryValue Root="HKLM" Key="Software\JarvisPowerPoint\Deployment"
+                           Name="ProductCode" Value="[ProductCode]" Type="string" />
+            <RegistryValue Root="HKLM" Key="Software\JarvisPowerPoint\Deployment"
+                           Name="Version" Value="[ProductVersion]" Type="string" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+    <Feature Id="Jarvis" Title="Jarvis PowerPoint" Level="1" Absent="disallow">
+      <ComponentRef Id="Application" />
+      <ComponentRef Id="ManagedMarker" />
+      <ComponentRef Id="License" />
+      <ComponentRef Id="DeploymentRegistration" />
+    </Feature>
+  </Product>
+</Wix>

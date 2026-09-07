@@ -44,15 +44,17 @@ namespace JarvisPowerPoint
         private string recognizerFailure;
 
         public SetupDialog(string initialCulture, string microphoneId)
+            : this(initialCulture, microphoneId, true) { }
+
+        internal SetupDialog(string initialCulture, string microphoneId, bool discoverDevices)
         {
             Text = "Jarvis PowerPoint";
             StartPosition = FormStartPosition.CenterScreen;
             MinimizeBox = false;
-            MaximizeBox = false;
+            MaximizeBox = true;
             ShowInTaskbar = true;
-            AutoScaleMode = AutoScaleMode.Dpi;
             ClientSize = new Size(720, 670);
-            MinimumSize = new Size(650, 660);
+            MinimumSize = new Size(600, 420);
             uiFont = new Font(SystemFonts.MessageBoxFont.FontFamily, 10);
             headingFont = new Font(uiFont, FontStyle.Bold);
             Font = uiFont;
@@ -64,7 +66,13 @@ namespace JarvisPowerPoint
             languages.SelectedIndex = string.Equals(initialCulture, "en-US",
                 StringComparison.OrdinalIgnoreCase) ? 1 : 0;
             updating = false;
-            LoadChoices(string.IsNullOrEmpty(microphoneId) ? "default" : microphoneId);
+            string selectedId = string.IsNullOrEmpty(microphoneId) ? "default" : microphoneId;
+            if (discoverDevices) LoadChoices(selectedId);
+            else
+            {
+                microphones.Items.Add(new AudioInputDevice(selectedId, UnavailableMicrophoneLabel()));
+                microphones.SelectedIndex = 0;
+            }
 
             languages.SelectedIndexChanged += SelectionChanged;
             microphones.SelectedIndexChanged += SelectionChanged;
@@ -87,6 +95,7 @@ namespace JarvisPowerPoint
             timer.Tick += PollTest;
             timer.Start();
             UpdateText();
+            UiAccessibility.Initialize(this);
         }
 
         public string SelectedCulture
@@ -117,23 +126,26 @@ namespace JarvisPowerPoint
             layout.AutoScroll = true;
             layout.Padding = new Padding(18);
             layout.ColumnCount = 1;
+            layout.RowCount = 0;
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             Controls.Add(layout);
             heading.Font = headingFont;
             AddRow(layout, heading);
             AddRow(layout, instructions);
             AddRow(layout, languageLabel);
+            languageLabel.UseMnemonic = true;
             languages.DropDownStyle = ComboBoxStyle.DropDownList;
             languages.AccessibleName = "Language";
             AddRow(layout, languages);
             AddRow(layout, microphoneLabel);
+            microphoneLabel.UseMnemonic = true;
             microphones.DropDownStyle = ComboBoxStyle.DropDownList;
             microphones.DropDownWidth = 640;
             AddRow(layout, microphones);
             refresh.AutoSize = true;
             refresh.Anchor = AnchorStyles.Left;
             AddRow(layout, refresh);
-            availability.ForeColor = Color.DarkRed;
+            availability.ForeColor = SystemColors.ControlText;
             AddRow(layout, availability);
             test.AutoSize = true;
             test.Anchor = AnchorStyles.Left;
@@ -147,31 +159,27 @@ namespace JarvisPowerPoint
             AddRow(layout, status);
             skip.AutoSize = true;
             AddRow(layout, skip);
-            privacy.ForeColor = SystemColors.GrayText;
+            privacy.ForeColor = SystemColors.ControlText;
             AddRow(layout, privacy);
             var buttons = new FlowLayoutPanel();
             buttons.AutoSize = true;
+            buttons.Dock = DockStyle.Bottom;
+            buttons.Padding = new Padding(12, 4, 12, 8);
+            buttons.TabIndex = 1;
             buttons.FlowDirection = FlowDirection.RightToLeft;
             finish.AutoSize = true;
+            finish.TabIndex = 0;
             cancel.AutoSize = true;
+            cancel.TabIndex = 1;
             buttons.Controls.Add(cancel);
             buttons.Controls.Add(finish);
-            AddRow(layout, buttons);
+            Controls.Add(buttons);
         }
 
         private static void AddRow(TableLayoutPanel layout, Control control)
         {
-            int row = layout.RowCount++;
-            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             control.Margin = new Padding(0, 0, 0, 9);
-            control.Dock = DockStyle.Top;
-            var label = control as Label;
-            if (label != null)
-            {
-                label.AutoSize = true;
-                label.MaximumSize = new Size(650, 0);
-            }
-            layout.Controls.Add(control, 0, row);
+            UiAccessibility.AddRow(layout, control);
         }
 
         private void LoadChoices(string selectedId)
@@ -235,7 +243,8 @@ namespace JarvisPowerPoint
 
         private bool CanUseSelection()
         {
-            return recognizerFailure == null && recognizers.ContainsKey(SelectedCulture) && DeviceAvailable();
+            return !SpeechInput.CaptureBlocked && recognizerFailure == null
+                && recognizers.ContainsKey(SelectedCulture) && DeviceAvailable();
         }
 
         private string UnavailableMicrophoneLabel()
@@ -282,22 +291,24 @@ namespace JarvisPowerPoint
         {
             if (closing || IsDisposed) return;
             Text = T("Configuration de Jarvis PowerPoint", "Jarvis PowerPoint setup");
+            AccessibleName = Text;
             heading.Text = T("Bienvenue — langue et microphone", "Welcome — language and microphone");
             instructions.Text = T(
                 "Choisissez une langue et un microphone. Le test est facultatif : démarrez-le, puis dites « Jarvis test ».",
                 "Choose a language and microphone. Testing is optional: start the test, then say “Jarvis test”.");
-            languageLabel.Text = T("1. Langue de reconnaissance", "1. Recognition language");
-            microphoneLabel.Text = T("2. Microphone (uniquement pour Jarvis)", "2. Microphone (Jarvis only)");
-            languages.AccessibleName = languageLabel.Text;
-            microphones.AccessibleName = microphoneLabel.Text;
-            refresh.Text = T("Actualiser les langues et microphones", "Refresh languages and microphones");
-            test.Text = session == null ? T("3. Démarrer le test local", "3. Start local test")
-                : T("Arrêter le test", "Stop test");
+            languageLabel.Text = T("1. &Langue de reconnaissance", "1. Recognition &language");
+            microphoneLabel.Text = T("2. &Microphone (uniquement pour Jarvis)", "2. &Microphone (Jarvis only)");
+            languages.AccessibleName = languageLabel.Text.Replace("&", "");
+            microphones.AccessibleName = microphoneLabel.Text.Replace("&", "");
+            microphones.AccessibleDescription = microphones.SelectedItem == null ? "" : microphones.SelectedItem.ToString();
+            UiAccessibility.Caption(refresh, T("&Actualiser les langues et microphones", "&Refresh languages and microphones"));
+            UiAccessibility.Caption(test, session == null ? T("3. Démarrer le &test local", "3. Start local &test")
+                : T("Arrêter le &test", "Stop &test"));
             test.Enabled = session != null || CanUseSelection();
-            skip.Text = T("Ignorer le test — enregistrer sans test vocal réussi",
-                "Skip test — save without a successful voice test");
-            finish.Text = T("Enregistrer / Terminer", "Save / Finish");
-            cancel.Text = T("Annuler", "Cancel");
+            UiAccessibility.Caption(skip, T("&Ignorer le test — enregistrer sans test vocal réussi",
+                "S&kip test — save without a successful voice test"));
+            UiAccessibility.Caption(finish, T("&Enregistrer / Terminer", "&Save / Finish"));
+            UiAccessibility.Caption(cancel, T("A&nnuler", "&Cancel"));
             finish.Enabled = CanUseSelection() && (tested || skip.Checked);
             privacy.Text = T("L'audio reste local ; le test ne contrôle pas PowerPoint. "
                 + "Aucun enregistrement audio sur disque, aucun envoi réseau.",
@@ -308,6 +319,8 @@ namespace JarvisPowerPoint
             heardLabel.Text = T("Phrase entendue : ", "Heard phrase: ")
                 + (heard.Length == 0 ? T("(aucune)", "(none)") : heard);
             var problems = new List<string>();
+            if (SpeechInput.CaptureBlocked)
+                problems.Add(SpeechInput.RestartRequiredMessage(English));
             if (!recognizers.ContainsKey(SelectedCulture))
                 problems.Add(T("Le moteur vocal ", "The speech recognizer ") + SelectedCulture
                     + T(" n'est pas installé pour cette application .NET. Dans Paramètres Windows > "
@@ -327,8 +340,10 @@ namespace JarvisPowerPoint
             if (enumerationFailure != null) problems.Add(enumerationFailure);
             availability.Text = string.Join(Environment.NewLine, problems.ToArray());
             availability.Visible = problems.Count != 0;
-            status.ForeColor = failure == null ? SystemColors.ControlText : Color.DarkRed;
-            if (failure != null)
+            status.ForeColor = SystemColors.ControlText;
+            if (SpeechInput.CaptureBlocked)
+                status.Text = SpeechInput.RestartRequiredMessage(English);
+            else if (failure != null)
                 status.Text = T("Échec du test : ", "Test failed: ") + failure;
             else if (session != null)
                 status.Text = tested
@@ -358,7 +373,15 @@ namespace JarvisPowerPoint
 
         private void PollTest(object sender, EventArgs e)
         {
-            if (closing || session == null) return;
+            if (closing) return;
+            if (SpeechInput.CaptureBlocked)
+            {
+                timer.Stop();
+                tested = false;
+                StopTest();
+                return;
+            }
+            if (session == null) return;
             level.Value = Math.Max(0, Math.Min(100, session.Level));
             string phrase = session.Heard;
             if (!string.IsNullOrEmpty(phrase))
@@ -411,6 +434,7 @@ namespace JarvisPowerPoint
                 return;
             }
             StopTest();
+            if (!CanUseSelection() || (!tested && !skip.Checked)) { UpdateText(); return; }
             DialogResult = DialogResult.OK;
             Close();
         }
@@ -467,6 +491,7 @@ namespace JarvisPowerPoint
 
             public TestSession(RecognizerInfo recognizer, string microphone)
             {
+                SpeechInput.EnsureCaptureAvailable();
                 try
                 {
                     engine = new SpeechRecognitionEngine(recognizer);
@@ -480,9 +505,9 @@ namespace JarvisPowerPoint
                     input = SpeechInput.Attach(engine, microphone);
                     engine.RecognizeAsync(RecognizeMode.Multiple);
                 }
-                catch
+                catch (Exception failure)
                 {
-                    SpeechInputErrors.CleanupPreservingFailure(Dispose);
+                    SpeechInputErrors.CleanupPreservingFailure(Dispose, failure);
                     throw;
                 }
             }
@@ -524,42 +549,25 @@ namespace JarvisPowerPoint
             {
                 if (disposed) return;
                 disposed = true;
-                if (engine == null) return;
                 SpeechRecognitionEngine old = engine;
                 engine = null;
-                old.AudioLevelUpdated -= OnLevel;
-                old.SpeechRecognized -= OnRecognized;
-                old.RecognizeCompleted -= OnCompleted;
-                var failures = new List<Exception>();
-                Exception failure;
-                try
+                IDisposable oldInput = input;
+                input = null;
+                if (old != null)
                 {
-                    failure = SpeechInputErrors.CaptureExpectedFailure(delegate
-                    {
-                        if (input != null) input.Dispose();
-                    });
-                    if (failure != null) failures.Add(failure);
+                    old.AudioLevelUpdated -= OnLevel;
+                    old.SpeechRecognized -= OnRecognized;
+                    old.RecognizeCompleted -= OnCompleted;
                 }
-                finally
-                {
-                    input = null;
-                    try
+                SpeechInputErrors.DisposeCapture(
+                    delegate { if (oldInput != null) oldInput.Dispose(); },
+                    delegate
                     {
-                        failure = SpeechInputErrors.CaptureExpectedFailure(delegate
-                        {
-                            try { old.RecognizeAsyncCancel(); }
-                            catch (InvalidOperationException) { } // Startup may have failed before listening began.
-                        });
-                        if (failure != null) failures.Add(failure);
-                    }
-                    finally
-                    {
-                        failure = SpeechInputErrors.CaptureExpectedFailure(old.Dispose);
-                        if (failure != null) failures.Add(failure);
-                    }
-                }
-                if (failures.Count != 0)
-                    throw new IOException("Local speech test cleanup failed.", new AggregateException(failures));
+                        if (old == null) return;
+                        try { old.RecognizeAsyncCancel(); }
+                        catch (InvalidOperationException) { } // Startup may have failed before listening began.
+                    },
+                    delegate { if (old != null) old.Dispose(); });
             }
         }
     }

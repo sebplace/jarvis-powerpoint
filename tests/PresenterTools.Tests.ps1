@@ -49,7 +49,7 @@ Assert-True (!$tracker.Entries[0].OverBudget) "Per-slide budget override failed.
 $tracker.Observe($two, (Time 100))
 Assert-True ($tracker.TotalSeconds -eq 40) "A stopped rehearsal accumulated time."
 
-$report = Join-Path ([IO.Path]::GetTempPath()) ("Jarvis-rehearsal-" + [Guid]::NewGuid().ToString("N") + ".csv")
+$report = Join-Path $PSScriptRoot ("Jarvis-rehearsal-" + [Guid]::NewGuid().ToString("N") + ".csv")
 try {
     $tracker.Export($report)
     $data = Import-Csv -LiteralPath $report
@@ -91,6 +91,9 @@ $context = [Runtime.Serialization.FormatterServices]::GetUninitializedObject($ty
 $flags = [Reflection.BindingFlags]"Instance,NonPublic"
 $cases = @(
     @{Culture="fr-FR"; Phrases=@(
+        @("Jarvis suivant", "JarvisNext", ""),
+        @("Jarvis diapo suivante", "JarvisNext", ""),
+        @("Jarvis diapositive pr\u00e9c\u00e9dente", "JarvisPrevious", ""),
         @("Jarvis reprends", "JarvisActions", "resume"),
         @("Jarvis mode questions", "JarvisActions", "questions"),
         @("Jarvis autre r\u00e9sultat", "JarvisActions", "results"),
@@ -100,9 +103,19 @@ $cases = @(
         @("Jarvis arr\u00eate la r\u00e9p\u00e9tition", "JarvisActions", "stopRehearsal"),
         @("Jarvis raccourci la d\u00e9mo", "JarvisAlias", ""),
         @("Jarvis cherche budget", "JarvisSearch", ""),
-        @("Jarvis va au slide vingt et un", "JarvisGoToSlide", "21")
+        @("Jarvis va au slide vingt et un", "JarvisGoToSlide", "21"),
+        @("Jarvis va \u00e0 la diapo septante et un", "JarvisGoToSlide", "71"),
+        @("Jarvis vas \u00e0 la diapositive nonante neuf", "JarvisGoToSlide", "99"),
+        @("Jarvis va \u00e0 la diapositive neuf cent nonante neuf", "JarvisGoToSlide", "999"),
+        @("Jarvis va au slide neuf cent quatre vingt dix neuf", "JarvisGoToSlide", "999"),
+        @("Jarvis va \u00e0 la diapo sur budget", "JarvisSearch", ""),
+        @("Jarvis vas \u00e0 la diapositive sur budget", "JarvisSearch", ""),
+        @("Jarvis affiche les diapositives", "JarvisActions", "display"),
+        @("Jarvis affiche les diapos", "JarvisActions", "display")
     )},
     @{Culture="en-US"; Phrases=@(
+        @("Jarvis next", "JarvisNext", ""),
+        @("Jarvis previous", "JarvisPrevious", ""),
         @("Jarvis resume", "JarvisActions", "resume"),
         @("Jarvis questions mode", "JarvisActions", "questions"),
         @("Jarvis another result", "JarvisActions", "results"),
@@ -121,8 +134,13 @@ foreach ($case in $cases) {
     if (!$info) { throw "Required test recognizer missing: $($case.Culture)" }
     $engine = [System.Speech.Recognition.SpeechRecognitionEngine]::new($info)
     try {
+        $type.GetField("currentCultureName", $flags).SetValue($context, $case.Culture)
         foreach ($name in @("CreateActionGrammar", "CreateAliasGrammar", "CreateSearchGrammar", "CreateGoToGrammar")) {
             $grammar = $type.GetMethod($name, $flags).Invoke($context, @($info.Culture))
+            $engine.LoadGrammar($grammar)
+        }
+        foreach ($next in @($true, $false)) {
+            $grammar = $type.GetMethod("CreateNavigationGrammar", $flags).Invoke($context, @($info.Culture, $next))
             $engine.LoadGrammar($grammar)
         }
         foreach ($phrase in $case.Phrases) {
@@ -133,7 +151,42 @@ foreach ($case in $cases) {
             if ($phrase[1] -eq "JarvisActions") {
                 Assert-True ($result.Semantics["action"].Value -eq $phrase[2]) "Wrong action: $text"
             } elseif ($phrase[1] -eq "JarvisGoToSlide") {
-                Assert-True ($result.Semantics["slideNumber"].Value -eq 21) "Number navigation regressed."
+                Assert-True ($result.Semantics["slideNumber"].Value -eq [int]$phrase[2]) "Number navigation regressed: $text."
+            }
+        }
+        $searchPrefixes = if ($case.Culture -eq "en-US") {
+            @("search for", "find", "go to the slide about")
+        } else {
+            @("cherche", "trouve", "va au slide sur", "vas au slide sur",
+                "va \u00e0 la diapo sur", "vas \u00e0 la diapo sur",
+                "va \u00e0 la diapositive sur", "vas \u00e0 la diapositive sur")
+        }
+        foreach ($prefix in $searchPrefixes) {
+            $text = "Jarvis " + [regex]::Unescape($prefix) + " budget"
+            $result = $engine.EmulateRecognize($text)
+            Assert-True ($null -ne $result -and $result.Grammar.Name -eq "JarvisSearch") "Search synonym grammar failed: $text"
+            $query = $type.GetMethod("ExtractSearchQuery", $flags).Invoke($context, @($result.Text))
+            Assert-True ($query -eq "budget") "Search grammar/extraction mismatch: $text"
+            $query = $type.GetMethod("ExtractSearchQuery", $flags).Invoke($context, @($text.ToUpperInvariant() + "  "))
+            Assert-True ($query -eq "BUDGET") "Search extraction casing/trimming regressed: $text"
+        }
+        foreach ($text in @("", "Jarvis unsupported budget")) {
+            $query = $type.GetMethod("ExtractSearchQuery", $flags).Invoke($context, @($text))
+            Assert-True ($query -eq "") "Unsupported search prefix produced a query."
+        }
+        if ($case.Culture -eq "fr-FR") {
+            $numbers = $assembly.GetType("JarvisPowerPoint.NumberWords", $true)
+            $seen = @{}
+            foreach ($number in 1..999) {
+                $belgian = $numbers.GetMethod("ToBelgianFrench").Invoke($null, @($number))
+                Assert-True (!$seen.ContainsKey($belgian)) "Belgian number collision at $number."
+                $seen[$belgian] = $number
+                $forms = @($belgian, $numbers.GetMethod("ToFrench").Invoke($null, @($number))) | Select-Object -Unique
+                foreach ($spoken in $forms) {
+                    $result = $engine.EmulateRecognize("Jarvis va au slide " + $spoken)
+                    Assert-True ($null -ne $result -and $result.Grammar.Name -eq "JarvisGoToSlide" `
+                        -and $result.Semantics["slideNumber"].Value -eq $number) "French/Belgian 1-999 grammar regression at $number."
+                }
             }
         }
     } finally { $engine.Dispose() }

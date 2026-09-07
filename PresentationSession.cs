@@ -3,21 +3,41 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using Office = Microsoft.Office.Core;
 using PowerPoint = Microsoft.Office.Interop.PowerPoint;
 
 namespace JarvisPowerPoint
 {
-    internal sealed class PresentationUnavailableException : InvalidOperationException
+    internal enum PresentationUnavailableReason
     {
-        public PresentationUnavailableException(string message) : base(message) { }
+        NoSlideShow,
+        MultipleSlideShows
     }
 
-    internal sealed class PresentationSession
+    internal sealed class PresentationUnavailableException : InvalidOperationException
     {
+        public PresentationUnavailableException(string message)
+            : this(message, PresentationUnavailableReason.NoSlideShow) { }
+
+        public PresentationUnavailableException(string message, PresentationUnavailableReason reason)
+            : base(message) { Reason = reason; }
+
+        public PresentationUnavailableReason Reason { get; private set; }
+    }
+
+    internal sealed partial class PresentationSession : IDisposable
+    {
+        private readonly int threadId = Thread.CurrentThread.ManagedThreadId;
+        private bool disposed;
         private readonly AliasStore aliasStore;
+        private readonly PresentationProfileStore profileStore;
         private readonly Func<PresentationConnection> connect;
+        // The second-ranked result is ambiguous when it is within 15% of the best score.
+        internal const double AmbiguityScoreRatio = 0.85;
+        private ConditionalWeakTable<SearchProposal, PreparedSearch> proposals =
+            new ConditionalWeakTable<SearchProposal, PreparedSearch>();
         private string identity;
         private string sessionKey;
         private string presentationKey;
@@ -26,6 +46,7 @@ namespace JarvisPowerPoint
         private List<PresentationSlide> results;
         private int resultIndex;
         private PowerPoint.PpSlideShowState? beforeBlack;
+        private SlideRoute activeRoute;
 
         public PresentationSession(bool english, string dataDirectory)
             : this(english, dataDirectory, null) { }
@@ -34,12 +55,36 @@ namespace JarvisPowerPoint
         {
             English = english;
             aliasStore = new AliasStore(dataDirectory);
+            profileStore = new PresentationProfileStore(dataDirectory);
             this.connect = connect ?? (() => new PowerPointConnection(English));
         }
 
         public bool English { get; set; }
         public bool HasReturnPoint { get { return returnPoint != null; } }
         public bool QuestionsMode { get; private set; }
+        public string ActiveRouteName { get { return activeRoute == null ? null : activeRoute.Name; } }
+
+        public void Dispose()
+        {
+            if (Thread.CurrentThread.ManagedThreadId != threadId)
+                throw new InvalidOperationException("Dispose the presentation session on its creating STA thread.");
+            if (disposed) return;
+            disposed = true;
+            try
+            {
+                if (activeSearchOperation != null) activeSearchOperation.Cancel();
+            }
+            finally
+            {
+                activeSearchOperation = null;
+                Reset();
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (disposed) throw new ObjectDisposedException("PresentationSession");
+        }
 
         public PresentationSnapshot Snapshot()
         {
@@ -51,6 +96,8 @@ namespace JarvisPowerPoint
                     SessionKey = sessionKey,
                     PresentationKey = presentationKey,
                     PresentationName = show.PresentationName,
+                    SavedPath = show.SavedPath,
+                    WindowHandle = show.WindowHandle,
                     SlideId = slide.Id,
                     SlideNumber = slide.Number,
                     SlideCount = show.SlideCount,
@@ -62,14 +109,12 @@ namespace JarvisPowerPoint
 
         public string Next()
         {
-            using (PresentationConnection show = Open()) show.Move(true);
-            return Text("Next slide.", "Diapositive suivante.");
+            return Move(true);
         }
 
         public string Previous()
         {
-            using (PresentationConnection show = Open()) show.Move(false);
-            return Text("Previous slide.", "Diapositive précédente.");
+            return Move(false);
         }
 
         public string GoTo(int slideNumber)
@@ -87,21 +132,129 @@ namespace JarvisPowerPoint
 
         public string Search(string query)
         {
-            if (string.IsNullOrWhiteSpace(query) || query.Length > 500 ||
-                string.IsNullOrEmpty(PowerPointController.NormalizeForSearch(query)))
-                throw Error("Enter a search of 1 to 500 characters containing words or numbers.",
-                    "Saisissez une recherche de 1 à 500 caractères contenant des mots ou des nombres.");
+            SearchProposal proposal = PrepareSearch(query);
+            return AcceptSearch(proposal, proposal.Candidates[0].SlideId);
+        }
+
+        public SearchProposal PrepareSearch(string query)
+        {
+            using (SearchOperation operation = BeginSearch(query))
+            {
+                while (!operation.Step()) { }
+                return operation.Proposal;
+            }
+        }
+
+        public string AcceptSearch(SearchProposal proposal, int selectedSlideId)
+        {
+            using (SearchOperation operation = BeginAcceptSearch(proposal, selectedSlideId))
+            {
+                while (!operation.Step()) { }
+                return operation.Result;
+            }
+        }
+
+        private string CommitSearch(SearchProposal proposal, int selectedSlideId)
+        {
             using (PresentationConnection show = Open())
             {
-                List<PresentationSlide> matches = show.Search(query);
-                if (matches.Count == 0)
-                    throw Error("No slide matches \"{0}\".", "Aucune diapositive ne correspond à « {0} ».", query);
-                PresentationSlide target = RequireSlide(show, matches[0].Id);
+                PreparedSearch prepared;
+                if (proposal == null || !proposals.TryGetValue(proposal, out prepared) ||
+                    proposal.SessionKey != sessionKey || prepared.SessionKey != sessionKey ||
+                    proposal.OriginSlideId != prepared.Origin || show.CurrentSlideId != prepared.Origin ||
+                    prepared.Generation != searchGeneration || !SearchVersionMatches(show, prepared))
+                    throw Error("The presentation or current slide changed. Search again.",
+                        "La présentation ou la diapositive actuelle a changé. Relancez la recherche.");
+                int selectedIndex = prepared.Matches.FindIndex(match => match.Id == selectedSlideId);
+                if (selectedIndex < 0)
+                    throw Error("Choose a slide from the proposed search results.",
+                        "Choisissez une diapositive parmi les résultats proposés.");
+                PresentationSlide target = RequireSlide(show, selectedSlideId);
                 Navigate(show, target);
-                results = matches;
-                resultIndex = 0;
-                return SlideMessage(target) + Text(" ({0} matches)", " ({0} résultats)", matches.Count);
+                results = prepared.Matches;
+                resultIndex = selectedIndex;
+                proposals.Remove(proposal);
+                return SlideMessage(target) + Text(" ({0} matches)", " ({0} résultats)", results.Count);
             }
+        }
+
+        public List<SlideChoice> GetSlides()
+        {
+            using (PresentationConnection show = Open())
+            {
+                var choices = new List<SlideChoice>();
+                for (int index = 1; index <= show.SlideCount; index++) choices.Add(ToChoice(show.SlideAt(index)));
+                return choices;
+            }
+        }
+
+        public List<SlideRoute> GetRoutes()
+        {
+            using (PresentationConnection show = Open()) return profileStore.LoadRoutes(RequireSavedPath(show));
+        }
+
+        public void SaveRoute(SlideRoute route)
+        {
+            SlideRoute copy;
+            try { copy = PresentationProfileStore.CopyRoute(route); }
+            catch (ArgumentException)
+            {
+                throw Error("Use a route name of 1 to 80 characters, a target of 1 to 240 minutes, and a nonempty list of unique slide IDs.",
+                    "Utilisez un nom de parcours de 1 à 80 caractères, une durée de 1 à 240 minutes et une liste non vide d’identifiants de diapositives uniques.");
+            }
+            using (PresentationConnection show = Open())
+            {
+                string path = RequireSavedPath(show);
+                foreach (int id in copy.SlideIds) RequireSlide(show, id);
+                List<SlideRoute> routes = profileStore.LoadRoutes(path);
+                int index = routes.FindIndex(item => string.Equals(item.Name, copy.Name, StringComparison.OrdinalIgnoreCase));
+                if (index < 0) routes.Add(copy);
+                else routes[index] = copy;
+                profileStore.SaveRoutes(path, routes);
+                if (activeRoute != null && string.Equals(activeRoute.Name, copy.Name, StringComparison.OrdinalIgnoreCase))
+                    activeRoute = copy;
+            }
+        }
+
+        public void RemoveRoute(string name)
+        {
+            name = ValidateRouteName(name);
+            using (PresentationConnection show = Open())
+            {
+                string path = RequireSavedPath(show);
+                List<SlideRoute> routes = profileStore.LoadRoutes(path);
+                if (routes.RemoveAll(item => string.Equals(item.Name, name, StringComparison.OrdinalIgnoreCase)) == 0)
+                    throw Error("No route named \"{0}\" exists for this presentation.",
+                        "Aucun parcours « {0} » pour cette présentation.", name);
+                profileStore.SaveRoutes(path, routes);
+                if (activeRoute != null && string.Equals(activeRoute.Name, name, StringComparison.OrdinalIgnoreCase))
+                    activeRoute = null;
+            }
+        }
+
+        public string ActivateRoute(string name)
+        {
+            name = ValidateRouteName(name);
+            using (PresentationConnection show = Open())
+            {
+                SlideRoute route = profileStore.LoadRoutes(RequireSavedPath(show)).Find(item =>
+                    string.Equals(item.Name, name, StringComparison.OrdinalIgnoreCase));
+                if (route == null)
+                    throw Error("No route named \"{0}\" exists for this presentation.",
+                        "Aucun parcours « {0} » pour cette présentation.", name);
+                PresentationSlide target = RequireSlide(show, route.SlideIds[0]);
+                show.GoTo(target.Id);
+                searchGeneration++;
+                activeRoute = route;
+                ClearHistory();
+                return Text("Route \"{0}\" active. ", "Parcours « {0} » actif. ", route.Name) + SlideMessage(target);
+            }
+        }
+
+        public string DeactivateRoute()
+        {
+            using (PresentationConnection show = Open()) activeRoute = null;
+            return Text("Standard slide order restored.", "Ordre normal des diapositives rétabli.");
         }
 
         public string NextResult()
@@ -146,13 +299,11 @@ namespace JarvisPowerPoint
                         "Aucun point de retour. Recherchez une diapositive, allez à une diapositive ou lancez les questions.");
                 PresentationSlide target = RequireSlide(show, returnPoint.SlideId);
                 show.GoTo(target.Id);
+                searchGeneration++;
                 bool animationRestored = show.RestoreClick(returnPoint.ClickIndex);
                 show.State = returnPoint.State;
                 beforeBlack = returnPoint.BeforeBlack;
-                returnPoint = null;
-                QuestionsMode = false;
-                results = null;
-                resultIndex = 0;
+                ClearHistory();
                 return Text("Resumed: ", "Reprise : ") + SlideMessage(target) +
                     (animationRestored ? string.Empty : Text(
                         " Animation position could not be restored.",
@@ -255,6 +406,7 @@ namespace JarvisPowerPoint
 
         private PresentationConnection Open()
         {
+            ThrowIfDisposed();
             PresentationConnection show;
             try
             {
@@ -280,6 +432,9 @@ namespace JarvisPowerPoint
                     presentationKey = currentPresentationKey;
                 }
                 elapsed = currentElapsed;
+                if (searchIndex != null && (searchIndex.Version != show.SearchVersion ||
+                    searchIndex.Documents.Count != show.SlideCount))
+                    InvalidateSearchIndex();
                 success = true;
                 return show;
             }
@@ -291,21 +446,81 @@ namespace JarvisPowerPoint
 
         private void Reset()
         {
+            InvalidateSearchIndex();
             identity = null;
             sessionKey = null;
             presentationKey = null;
             elapsed = 0;
+            ClearHistory();
+            activeRoute = null;
+            beforeBlack = null;
+        }
+
+        private void ClearHistory()
+        {
             returnPoint = null;
             results = null;
             resultIndex = 0;
             QuestionsMode = false;
-            beforeBlack = null;
+        }
+
+        private string Move(bool next)
+        {
+            using (PresentationConnection show = Open())
+            {
+                if (activeRoute != null && !QuestionsMode)
+                {
+                    int currentIndex = activeRoute.SlideIds.IndexOf(show.CurrentSlide().Id);
+                    if (currentIndex >= 0)
+                    {
+                        int direction = next ? 1 : -1;
+                        for (int index = currentIndex + direction; index >= 0 && index < activeRoute.SlideIds.Count; index += direction)
+                        {
+                            PresentationSlide target = show.FindSlide(activeRoute.SlideIds[index]);
+                            if (target == null) continue;
+                            // Route navigation deliberately skips whole slides, not individual animations.
+                            show.GoTo(target.Id);
+                            searchGeneration++;
+                            return SlideMessage(target);
+                        }
+                        return next
+                            ? Text("End of route \"{0}\". The slide show remains open.", "Fin du parcours « {0} ». Le diaporama reste ouvert.", activeRoute.Name)
+                            : Text("Start of route \"{0}\".", "Début du parcours « {0} ».", activeRoute.Name);
+                    }
+                    if (!activeRoute.SlideIds.Exists(id => show.FindSlide(id) != null))
+                        throw Error("All slides in this route were deleted. Edit or deactivate the route.",
+                            "Toutes les diapositives de ce parcours ont été supprimées. Modifiez ou désactivez le parcours.");
+                }
+                show.Move(next);
+                searchGeneration++;
+                return next ? Text("Next slide.", "Diapositive suivante.")
+                    : Text("Previous slide.", "Diapositive précédente.");
+            }
+        }
+
+        private string ValidateRouteName(string name)
+        {
+            try
+            {
+                return PresentationProfileStore.NormalizeRouteName(name);
+            }
+            catch (ArgumentException)
+            {
+                throw Error("Use a route name of 1 to 80 characters, without control characters.",
+                    "Utilisez un nom de parcours de 1 à 80 caractères, sans caractères de contrôle.");
+            }
+        }
+
+        private static SlideChoice ToChoice(PresentationSlide slide)
+        {
+            return new SlideChoice { SlideId = slide.Id, SlideNumber = slide.Number, Title = slide.Title, Score = slide.Score };
         }
 
         private void Navigate(PresentationConnection show, PresentationSlide target)
         {
             ReturnPoint candidate = returnPoint == null ? Capture(show) : null;
             show.GoTo(target.Id);
+            searchGeneration++;
             if (candidate != null && candidate.SlideId != target.Id)
                 returnPoint = candidate;
         }
@@ -333,8 +548,8 @@ namespace JarvisPowerPoint
         private string RequireSavedPath(PresentationConnection show)
         {
             if (string.IsNullOrEmpty(show.SavedPath))
-                throw Error("Save this presentation in PowerPoint before using aliases.",
-                    "Enregistrez cette présentation dans PowerPoint avant d’utiliser les alias.");
+                throw Error("Save this presentation in PowerPoint before using aliases or presentation profiles.",
+                    "Enregistrez cette présentation dans PowerPoint avant d’utiliser les alias ou les profils.");
             return show.SavedPath;
         }
 
@@ -383,6 +598,16 @@ namespace JarvisPowerPoint
             public PowerPoint.PpSlideShowState State;
             public PowerPoint.PpSlideShowState? BeforeBlack;
         }
+
+        private sealed class PreparedSearch
+        {
+            public string SessionKey;
+            public int Origin;
+            public List<PresentationSlide> Matches;
+            public long Generation;
+            public string Version;
+            public List<SearchDocument> Documents;
+        }
     }
 
     // This short-lived boundary also lets the session invariants be tested without touching PowerPoint.
@@ -392,14 +617,20 @@ namespace JarvisPowerPoint
         public abstract string PresentationKey { get; }
         public abstract string PresentationName { get; }
         public abstract string SavedPath { get; }
+        public virtual IntPtr WindowHandle { get { return IntPtr.Zero; } }
         public abstract int SlideCount { get; }
         public abstract float Elapsed { get; }
         public abstract int? ClickIndex { get; }
         public abstract PowerPoint.PpSlideShowState State { get; set; }
         public abstract PresentationSlide CurrentSlide();
+        public virtual int CurrentSlideId { get { return CurrentSlide().Id; } }
         public abstract PresentationSlide SlideAt(int number);
+        public virtual int SlideIdAt(int number) { return SlideAt(number).Id; }
         public abstract PresentationSlide FindSlide(int id);
         public abstract List<PresentationSlide> Search(string query);
+        public virtual bool SupportsSearchIndex { get { return false; } }
+        public virtual string SearchVersion { get { return null; } }
+        public virtual SearchSlideReader OpenSearchSlide(int number) { throw new NotSupportedException(); }
         public abstract void GoTo(int id);
         public abstract void Move(bool next);
         public abstract bool RestoreClick(int? index);
@@ -411,6 +642,7 @@ namespace JarvisPowerPoint
         public int Id;
         public int Number;
         public string Title;
+        public int Score;
     }
 
     internal sealed class PowerPointConnection : PresentationConnection
@@ -431,6 +663,10 @@ namespace JarvisPowerPoint
         public PowerPointConnection(bool english)
         {
             this.english = english;
+            if (Thread.CurrentThread.GetApartmentState() != ApartmentState.STA)
+                throw new InvalidOperationException(english
+                    ? "PowerPoint connections must be opened on the UI STA thread."
+                    : "Les connexions PowerPoint doivent être ouvertes sur le thread STA de l’interface.");
             bool success = false;
             try
             {
@@ -448,7 +684,8 @@ namespace JarvisPowerPoint
                 if (windows.Count != 1)
                     throw new PresentationUnavailableException(english
                         ? "Several slide shows are running. Keep only one running before using presentation controls."
-                        : "Plusieurs diaporamas sont en cours. Gardez un seul diaporama actif pour utiliser les commandes.");
+                        : "Plusieurs diaporamas sont en cours. Gardez un seul diaporama actif pour utiliser les commandes.",
+                        PresentationUnavailableReason.MultipleSlideShows);
                 window = windows[1];
                 view = window.View;
                 if (view.State == PowerPoint.PpSlideShowState.ppSlideShowDone) throw Unavailable();
@@ -470,8 +707,28 @@ namespace JarvisPowerPoint
         public override string PresentationKey { get { return presentationKey; } }
         public override string PresentationName { get { return presentation.Name; } }
         public override string SavedPath { get { return savedPath; } }
+        public override IntPtr WindowHandle { get { return new IntPtr(window.HWND); } }
         public override int SlideCount { get { return slides.Count; } }
         public override float Elapsed { get { return view.PresentationElapsedTime; } }
+        public override bool SupportsSearchIndex { get { return true; } }
+        public override string SearchVersion
+        {
+            get
+            {
+                // PowerPoint exposes no reliable edit revision. Never reuse dirty/unsaved
+                // text: Saved=false remains false through any number of subsequent edits.
+                if (presentation.Saved != Office.MsoTriState.msoTrue || savedPath == null) return null;
+                try
+                {
+                    var file = new System.IO.FileInfo(savedPath);
+                    if (!file.Exists) return null;
+                    return file.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture) + ":" +
+                        file.Length.ToString(CultureInfo.InvariantCulture);
+                }
+                catch (System.IO.IOException) { return null; }
+                catch (UnauthorizedAccessException) { return null; }
+            }
+        }
         public override PowerPoint.PpSlideShowState State
         {
             get { return view.State; }
@@ -506,6 +763,30 @@ namespace JarvisPowerPoint
             finally { Release(slide); }
         }
 
+        public override int CurrentSlideId
+        {
+            get
+            {
+                PowerPoint.Slide slide = null;
+                try { slide = view.Slide; return slide.SlideID; }
+                finally { Release(slide); }
+            }
+        }
+
+        public override int SlideIdAt(int number)
+        {
+            PowerPoint.Slide slide = null;
+            try { slide = slides[number]; return slide.SlideID; }
+            finally { Release(slide); }
+        }
+
+        public override SearchSlideReader OpenSearchSlide(int number)
+        {
+            PowerPoint.Slide slide = slides[number];
+            try { return new PowerPointSearchSlideReader(slide); }
+            catch { Release(slide); throw; }
+        }
+
         public override PresentationSlide SlideAt(int number)
         {
             PowerPoint.Slide slide = null;
@@ -519,6 +800,21 @@ namespace JarvisPowerPoint
 
         public override PresentationSlide FindSlide(int id)
         {
+            PowerPoint.Slide found = null;
+            try
+            {
+                try { found = slides.FindBySlideID(id); }
+                catch (COMException exception)
+                {
+                    // PowerPoint uses different missing-ID errors across versions. Preserve
+                    // deleted-slide behavior, but never hide busy/disconnected COM.
+                    if (exception.ErrorCode == unchecked((int)0x80010001) ||
+                        exception.ErrorCode == unchecked((int)0x8001010A) ||
+                        exception.ErrorCode == unchecked((int)0x80010108)) throw;
+                }
+                if (found != null) return Describe(found);
+            }
+            finally { Release(found); }
             for (int number = 1; number <= slides.Count; number++)
             {
                 PowerPoint.Slide slide = null;
@@ -537,7 +833,11 @@ namespace JarvisPowerPoint
             List<PowerPointController.SlideSearchResult> matches = PowerPointController.FindSlides(slides, query);
             var found = new List<PresentationSlide>();
             foreach (PowerPointController.SlideSearchResult match in matches)
-                found.Add(SlideAt(match.SlideNumber));
+            {
+                PresentationSlide slide = SlideAt(match.SlideNumber);
+                slide.Score = match.Score;
+                found.Add(slide);
+            }
             return found;
         }
 

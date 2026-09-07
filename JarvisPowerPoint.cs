@@ -19,7 +19,7 @@ using PowerPoint = Microsoft.Office.Interop.PowerPoint;
 [assembly: AssemblyDescription("Commande vocale locale pour avancer un diaporama PowerPoint")]
 [assembly: AssemblyCompany("Jarvis PowerPoint")]
 [assembly: AssemblyProduct("Jarvis PowerPoint")]
-[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyVersion("1.5.0.0")]
 
 namespace JarvisPowerPoint
 {
@@ -28,6 +28,7 @@ namespace JarvisPowerPoint
         [STAThread]
         private static void Main(string[] args)
         {
+            if (UpdateManager.TryHandleCommandLine(args)) { return; }
             if (args.Length == 1 &&
                 (args[0].Equals("--next", StringComparison.OrdinalIgnoreCase) ||
                  args[0].Equals("--previous", StringComparison.OrdinalIgnoreCase)))
@@ -66,13 +67,24 @@ namespace JarvisPowerPoint
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new JarvisApplicationContext());
+            bool created;
+            using (var mutex = new System.Threading.Mutex(true, @"Local\JarvisPowerPoint.GUI", out created))
+            {
+                if (!created)
+                {
+                    MessageBox.Show("Jarvis PowerPoint est déjà actif dans la zone de notification.\n"
+                        + "Jarvis PowerPoint is already running in the notification area.",
+                        "Jarvis PowerPoint", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                try { Application.Run(new JarvisApplicationContext()); }
+                finally { mutex.ReleaseMutex(); }
+            }
         }
     }
 
-    internal sealed class JarvisApplicationContext : ApplicationContext
+    internal sealed partial class JarvisApplicationContext : ApplicationContext
     {
-        private const float MinimumConfidence = 0.70f;
         private static readonly TimeSpan CommandCooldown = TimeSpan.FromMilliseconds(1200);
 
         private readonly NotifyIcon notifyIcon;
@@ -159,9 +171,10 @@ namespace JarvisPowerPoint
                 Visible = true
             };
             notifyIcon.DoubleClick += ToggleListening;
+            InitializeEnhancements();
 
             presentationTimer.Tick += delegate { PollPresentation(); };
-            presentationTimer.Start();
+            InitializeSpeechRecovery();
             Application.Idle += OnFirstIdle;
         }
 
@@ -177,6 +190,7 @@ namespace JarvisPowerPoint
                     throw new InvalidDataException(English ? "Invalid microphone preference. Open microphone setup." : "Préférence de microphone invalide. Ouvrez les réglages.");
                 }
                 microphoneId = (string)storedMicrophone;
+                RunUiAction(LoadEnhancementSettings);
                 object completed = Registry.GetValue(
                     @"HKEY_CURRENT_USER\Software\JarvisPowerPoint", "SetupCompleted", 0);
                 if (!(completed is int) || (int)completed != 1) { OpenSetup(true); }
@@ -189,7 +203,26 @@ namespace JarvisPowerPoint
         private void OpenSetup(bool firstRun)
         {
             if (activeSetup != null) { activeSetup.Activate(); return; }
-            DisposeRecognizer();
+            speechRecovery.Setup(true);
+            Exception cleanup = SpeechInputErrors.CaptureExpectedFailure(DisposeRecognizer);
+            if (cleanup != null)
+            {
+                cleanupBlocked = true;
+                diagnostics.Record(DiagnosticCategory.Speech, false, cleanup);
+                lastOutcome = cleanup.Message;
+            }
+            if (cleanupBlocked || SpeechInput.CaptureBlocked || speechRecovery.RestartRequired)
+            {
+                // Setup can open a test capture too; unsafe native ownership blocks every new capture.
+                cleanupBlocked = true;
+                speechRecovery.Setup(false);
+                speechRecovery.Fail(clock.Elapsed, false);
+                SetRecoveryStatus();
+                UpdatePollingSchedule();
+                UpdateStatus();
+                return;
+            }
+            UpdatePollingSchedule();
             UpdateStatus();
             RunUiAction(delegate
             {
@@ -198,7 +231,8 @@ namespace JarvisPowerPoint
                     activeSetup = dialog;
                     try
                     {
-                        if (dialog.ShowDialog() == DialogResult.OK && !exiting)
+                        if (dialog.ShowDialog() == DialogResult.OK && !exiting &&
+                            !cleanupBlocked && !SpeechInput.CaptureBlocked && !speechRecovery.RestartRequired)
                         {
                             currentCultureName = dialog.SelectedCulture;
                             microphoneId = dialog.SelectedMicrophoneId;
@@ -210,10 +244,14 @@ namespace JarvisPowerPoint
                     finally { activeSetup = null; }
                 }
             });
+            speechRecovery.Setup(false);
             if (exiting) { return; }
             session.English = English;
             UpdateLanguageMenu();
-            if (!exiting && !firstRun) { InitializeSpeechRecognition(); }
+            SetRecoveryStatus();
+            UpdatePollingSchedule();
+            UpdateStatus();
+            if (!exiting && !firstRun && listeningRequested) { PrepareSpeechStart(); }
         }
 
         private void WirePresenterPanel()
@@ -247,8 +285,10 @@ namespace JarvisPowerPoint
                 RunUiAction(delegate
                 {
                     if (panel.SelectedRehearsalSlideId == 0) { throw new InvalidOperationException(English ? "Select a recorded slide." : "Sélectionnez une diapositive chronométrée."); }
-                    rehearsal.SetBudget(panel.SelectedRehearsalSlideId, panel.BudgetSeconds);
-                    lastOutcome = English ? "Slide budget updated." : "Budget du slide actualisé.";
+                    SaveSelectedRehearsalBudget();
+                    lastOutcome = string.IsNullOrEmpty(rehearsal.SavedPath)
+                        ? (English ? "Temporary budget updated; save the presentation to persist budgets." : "Budget temporaire actualisé ; enregistrez la présentation pour mémoriser les budgets.")
+                        : (English ? "Slide budget saved for this presentation." : "Budget du slide mémorisé pour cette présentation.");
                     panel.SetRehearsal(rehearsal);
                 });
             };
@@ -298,6 +338,7 @@ namespace JarvisPowerPoint
             panel.Activate();
             UpdateStatus();
             PollPresentation();
+            panel.SetRehearsal(rehearsal);
         }
 
         private void RefreshAliases()
@@ -310,8 +351,12 @@ namespace JarvisPowerPoint
         private string StartRehearsal()
         {
             if (rehearsal.IsRunning) { throw new InvalidOperationException(English ? "Rehearsal is already running." : "La répétition est déjà en cours."); }
+            PersistRehearsal();
+            PresentationSnapshot snapshot = session.Snapshot();
+            Dictionary<int, int> budgets = string.IsNullOrEmpty(snapshot.SavedPath)
+                ? new Dictionary<int, int>() : profiles.LoadBudgets(snapshot.SavedPath);
             rehearsal.DefaultBudgetSeconds = panel.BudgetSeconds;
-            rehearsal.Start(session.Snapshot(), clock.Elapsed);
+            rehearsal.Start(snapshot, clock.Elapsed, budgets);
             panel.SetRehearsal(rehearsal);
             return English ? "Rehearsal started. No audio is recorded." : "Répétition démarrée. Aucun audio enregistré.";
         }
@@ -321,26 +366,15 @@ namespace JarvisPowerPoint
             if (!rehearsal.IsRunning) { throw new InvalidOperationException(English ? "No rehearsal is running." : "Aucune répétition en cours."); }
             rehearsal.Stop(clock.Elapsed);
             panel.SetRehearsal(rehearsal);
-            return English ? "Rehearsal stopped; report is in Presenter tools." : "Répétition arrêtée ; bilan dans les outils présentateur.";
+            return PersistRehearsal();
         }
 
         private void PollPresentation()
         {
-            if (exiting) { return; }
-            Exception microphoneError = SpeechInput.GetError(microphoneInput);
-            if (microphoneError != null)
-            {
-                string message = microphoneError.Message;
-                try { DisposeRecognizer(); }
-                catch (IOException exception) { message += "\n" + exception.Message; }
-                SetUnavailable(English ? "Microphone stopped" : "Microphone arrêté", message);
-            }
-            if (microphoneInput != null)
-            {
-                audioLevel = SpeechInput.GetLevel(microphoneInput);
-                UpdateStatus();
-            }
+            if (exiting || speechRecovery.IsSuspended) { return; }
+            UpdatePollingSchedule();
             if (!panel.Visible && !rehearsal.IsRunning && !session.HasReturnPoint) { return; }
+            bool wasRehearsing = rehearsal.IsRunning;
             try
             {
                 PresentationSnapshot snapshot = session.Snapshot();
@@ -355,7 +389,8 @@ namespace JarvisPowerPoint
                 rehearsalHint = rehearsal.IsRunning && current != null && current.OverBudget
                     ? (English ? "Over slide budget" : "Budget du slide dépassé") : "";
                 panel.SetPresentation(snapshot.PresentationName + " · " + snapshot.SlideNumber + "/" + snapshot.SlideCount
-                    + (session.QuestionsMode ? (English ? " · Questions mode" : " · Mode questions") : ""));
+                    + (session.QuestionsMode ? (English ? " · Questions mode" : " · Mode questions") : "")
+                    + (session.ActiveRouteName == null ? "" : " · " + session.ActiveRouteName));
             }
             catch (PresentationUnavailableException exception)
             {
@@ -387,35 +422,46 @@ namespace JarvisPowerPoint
                 rehearsalHint = "";
                 panel.SetPresentation(exception.Message);
             }
-            panel.SetRehearsal(rehearsal);
+            if (panel.Visible && (wasRehearsing || rehearsal.IsRunning)) panel.SetRehearsal(rehearsal);
+            if (wasRehearsing && !rehearsal.IsRunning)
+            {
+                RunUiAction(delegate { lastOutcome = PersistRehearsal(); }, DiagnosticCategory.Profiles);
+            }
             UpdateStatus();
+            UpdatePollingSchedule();
         }
 
         private void ExecuteCommand(Func<string> command)
         {
             RunUiAction(delegate
             {
+                if (modalDepth > 0)
+                {
+                    throw new InvalidOperationException(English ? "Close the open dialog before navigating." : "Fermez le dialogue ouvert avant de naviguer.");
+                }
                 if (rehearsal.IsRunning) { PollPresentation(); }
                 lastOutcome = command();
                 PollPresentation();
-            });
+            }, DiagnosticCategory.Navigation);
         }
 
-        private void RunUiAction(Action action)
+        private void RunUiAction(Action action, DiagnosticCategory category = DiagnosticCategory.Settings)
         {
-            bool failed = true;
-            try { action(); failed = false; }
-            catch (COMException exception) { lastOutcome = exception.Message; }
-            catch (InvalidOperationException exception) { lastOutcome = exception.Message; }
-            catch (IOException exception) { lastOutcome = exception.Message; }
-            catch (UnauthorizedAccessException exception) { lastOutcome = exception.Message; }
-            catch (SecurityException exception) { lastOutcome = exception.Message; }
-            catch (ArgumentException exception) { lastOutcome = exception.Message; }
-            catch (System.Xml.XmlException exception) { lastOutcome = exception.Message; }
-            catch (System.ComponentModel.Win32Exception exception) { lastOutcome = exception.Message; }
+            Exception failure = null;
+            try { action(); }
+            catch (COMException exception) { failure = exception; }
+            catch (InvalidOperationException exception) { failure = exception; }
+            catch (IOException exception) { failure = exception; }
+            catch (UnauthorizedAccessException exception) { failure = exception; }
+            catch (SecurityException exception) { failure = exception; }
+            catch (ArgumentException exception) { failure = exception; }
+            catch (System.Xml.XmlException exception) { failure = exception; }
+            catch (System.ComponentModel.Win32Exception exception) { failure = exception; }
+            diagnostics.Record(category, failure == null, failure);
+            if (failure != null) { lastOutcome = failure.Message; }
             if (exiting) { return; }
             UpdateStatus();
-            if (failed && !panel.Visible)
+            if (failure != null && !panel.Visible)
             {
                 ShowNotification(English ? "Action not completed" : "Action non exécutée",
                     English ? "Open Presenter tools from the Jarvis tray menu for details."
@@ -426,6 +472,11 @@ namespace JarvisPowerPoint
         private void ConfigureStartMenuShortcut(bool fromMenu)
         {
             bool english = currentCultureName == "en-US";
+            if (ManagedDeployment.IsManaged)
+            {
+                if (fromMenu) { lastOutcome = ManagedDeployment.GetMessage(english); UpdateStatus(); }
+                return;
+            }
             try
             {
                 var shortcut = new StartMenuShortcut(
@@ -495,10 +546,24 @@ namespace JarvisPowerPoint
 
         private void InitializeSpeechRecognition()
         {
-            DisposeRecognizer();
-            if (!listeningRequested) { UpdateStatus(); return; }
-            try
+            if (!listeningRequested || !speechRecovery.CanStart || exiting || activeSetup != null)
             {
+                UpdateStatus();
+                UpdatePollingSchedule();
+                return;
+            }
+            if (cleanupBlocked || SpeechInput.CaptureBlocked)
+            {
+                cleanupBlocked = true;
+                speechRecovery.Fail(clock.Elapsed, false);
+                SetRecoveryStatus();
+                UpdateStatus();
+                UpdatePollingSchedule();
+                return;
+            }
+            Exception failure = SpeechInputErrors.CaptureExpectedFailure(delegate
+            {
+                DisposeRecognizer();
                 RecognizerInfo recognizerInfo = SpeechRecognitionEngine.InstalledRecognizers()
                     .FirstOrDefault(info => info.Culture.Name.Equals(currentCultureName, StringComparison.OrdinalIgnoreCase));
                 if (recognizerInfo == null)
@@ -512,18 +577,10 @@ namespace JarvisPowerPoint
                 }
                 recognizer = new SpeechRecognitionEngine(recognizerInfo);
 
-                var nextCommand = new GrammarBuilder { Culture = recognizerInfo.Culture };
-                nextCommand.Append("Jarvis");
-                nextCommand.Append(currentCultureName == "en-US" ? "next" : "suivant");
-
-                var previousCommand = new GrammarBuilder { Culture = recognizerInfo.Culture };
-                previousCommand.Append("Jarvis");
-                previousCommand.Append(currentCultureName == "en-US" ? "previous" : "précédent");
-
                 Grammar goToGrammar = CreateGoToGrammar(recognizerInfo.Culture);
                 Grammar searchGrammar = CreateSearchGrammar(recognizerInfo.Culture);
-                recognizer.LoadGrammar(new Grammar(nextCommand) { Name = "JarvisNext" });
-                recognizer.LoadGrammar(new Grammar(previousCommand) { Name = "JarvisPrevious" });
+                recognizer.LoadGrammar(CreateNavigationGrammar(recognizerInfo.Culture, true));
+                recognizer.LoadGrammar(CreateNavigationGrammar(recognizerInfo.Culture, false));
                 recognizer.LoadGrammar(goToGrammar);
                 recognizer.LoadGrammar(searchGrammar);
                 recognizer.LoadGrammar(CreateActionGrammar(recognizerInfo.Culture));
@@ -531,42 +588,25 @@ namespace JarvisPowerPoint
                 microphoneInput = SpeechInput.Attach(recognizer, microphoneId);
                 recognizer.SpeechRecognized += OnSpeechRecognized;
                 recognizer.RecognizeCompleted += OnRecognitionCompleted;
-                recognizer.AudioLevelUpdated += OnAudioLevelUpdated;
+                if (microphoneInput == null) recognizer.AudioLevelUpdated += OnAudioLevelUpdated;
 
                 toggleItem.Enabled = true;
                 StartRecognition();
                 UpdateLanguageMenu();
-            }
-            catch (InvalidOperationException exception)
-            {
-                DisposeRecognizer();
-                SetUnavailable("Microphone indisponible", exception.Message);
-            }
-            catch (IOException exception)
-            {
-                DisposeRecognizer();
-                SetUnavailable("Microphone indisponible", exception.Message);
-            }
-            catch (COMException exception)
-            {
-                DisposeRecognizer();
-                SetUnavailable("Microphone indisponible", exception.Message);
-            }
-            catch (ArgumentException exception)
-            {
-                DisposeRecognizer();
-                SetUnavailable("Reconnaissance indisponible", exception.Message);
-            }
-            catch (UnauthorizedAccessException exception)
-            {
-                DisposeRecognizer();
-                SetUnavailable(English ? "Microphone access denied" : "Accès microphone refusé", exception.Message);
-            }
-            catch (SecurityException exception)
-            {
-                DisposeRecognizer();
-                SetUnavailable(English ? "Microphone access denied" : "Accès microphone refusé", exception.Message);
-            }
+            });
+            if (failure != null) SpeechFailed(failure);
+            UpdatePollingSchedule();
+        }
+
+        private Grammar CreateNavigationGrammar(CultureInfo culture, bool next)
+        {
+            var command = new GrammarBuilder { Culture = culture };
+            command.Append("Jarvis");
+            command.Append(culture.Name == "en-US"
+                ? new Choices(next ? "next" : "previous")
+                : next ? new Choices("suivant", "diapo suivante", "diapositive suivante")
+                    : new Choices("précédent", "diapo précédente", "diapositive précédente"));
+            return new Grammar(command) { Name = next ? "JarvisNext" : "JarvisPrevious" };
         }
 
         private Grammar CreateGoToGrammar(CultureInfo culture)
@@ -580,7 +620,8 @@ namespace JarvisPowerPoint
             }
             else
             {
-                command.Append(new Choices("va au slide", "vas au slide"));
+                command.Append(new Choices("va au slide", "vas au slide", "va à la diapo", "vas à la diapo",
+                    "va à la diapositive", "vas à la diapositive"));
             }
 
             var slideNumbers = new List<GrammarBuilder>();
@@ -590,6 +631,11 @@ namespace JarvisPowerPoint
                     ? NumberWords.ToEnglish(number)
                     : NumberWords.ToFrench(number);
                 slideNumbers.Add(new SemanticResultValue(spokenNumber, number));
+                if (culture.Name != "en-US")
+                {
+                    string belgian = NumberWords.ToBelgianFrench(number);
+                    if (belgian != spokenNumber) slideNumbers.Add(new SemanticResultValue(belgian, number));
+                }
             }
 
             command.Append(
@@ -604,12 +650,17 @@ namespace JarvisPowerPoint
         {
             var command = new GrammarBuilder { Culture = culture };
             command.Append("Jarvis");
-            command.Append(
-                culture.Name == "en-US"
-                    ? new Choices("search for", "find", "go to the slide about")
-                    : new Choices("cherche", "trouve", "va au slide sur", "vas au slide sur"));
+            command.Append(new Choices(GetSearchCommandPhrases(culture.Name == "en-US")));
             command.AppendDictation();
             return new Grammar(command) { Name = "JarvisSearch" };
+        }
+
+        private static string[] GetSearchCommandPhrases(bool english)
+        {
+            return english
+                ? new[] { "search for", "find", "go to the slide about" }
+                : new[] { "cherche", "trouve", "va au slide sur", "vas au slide sur",
+                    "va à la diapo sur", "vas à la diapo sur", "va à la diapositive sur", "vas à la diapositive sur" };
         }
 
         private Grammar CreateAliasGrammar(CultureInfo culture)
@@ -631,7 +682,7 @@ namespace JarvisPowerPoint
             AddActions(alternatives, "results", english ? new[] { "next match", "another result" } : new[] { "autre résultat", "résultat suivant" });
             AddActions(alternatives, "questions", english ? new[] { "questions mode" } : new[] { "mode questions" });
             AddActions(alternatives, "black", english ? new[] { "black screen" } : new[] { "écran noir" });
-            AddActions(alternatives, "display", english ? new[] { "restore slides", "show slides" } : new[] { "affiche", "affiche les slides" });
+            AddActions(alternatives, "display", english ? new[] { "restore slides", "show slides" } : new[] { "affiche", "affiche les slides", "affiche les diapos", "affiche les diapositives" });
             AddActions(alternatives, "rehearse", english ? new[] { "start rehearsal" } : new[] { "démarre la répétition" });
             AddActions(alternatives, "stopRehearsal", english ? new[] { "stop rehearsal" } : new[] { "arrête la répétition" });
             AddActions(alternatives, "test", new[] { "test" });
@@ -648,6 +699,12 @@ namespace JarvisPowerPoint
 
         private void ChangeLanguage(object sender, EventArgs eventArgs)
         {
+            if (cleanupBlocked || SpeechInput.CaptureBlocked || speechRecovery.RestartRequired)
+            {
+                SetRecoveryStatus();
+                UpdateStatus();
+                return;
+            }
             var item = sender as ToolStripMenuItem;
             string requestedCulture = item == null ? null : item.Tag as string;
 
@@ -660,40 +717,51 @@ namespace JarvisPowerPoint
             currentCultureName = requestedCulture;
             session.English = English;
             UpdateLanguageMenu();
-            InitializeSpeechRecognition();
+            if (listeningRequested) PrepareSpeechStart();
             SavePreferredCulture();
         }
 
         private void StartRecognition()
         {
-            if (recognizer == null || recognitionRunning || exiting)
+            if (recognizer == null || recognitionRunning || exiting || !speechRecovery.CanStart || activeSetup != null)
             {
                 return;
             }
 
-            try
-            {
-                recognizer.RecognizeAsync(RecognizeMode.Multiple);
-                recognitionRunning = true;
-                acceptsCommands = true;
-                listeningStatus = "";
-                UpdateStatus();
-            }
-            catch (InvalidOperationException exception)
-            {
-                acceptsCommands = false;
-                SetUnavailable("Écoute impossible", exception.Message);
-            }
+            SpeechInput.EnsureCaptureAvailable();
+            recognizer.RecognizeAsync(RecognizeMode.Multiple);
+            recognitionRunning = true;
+            acceptsCommands = true;
+            listeningStatus = speechRecovery.Succeeded()
+                ? (English ? "Recovered; same microphone" : "Reprise effectuée ; même microphone") : "";
+            diagnostics.Record(DiagnosticCategory.Speech, true);
+            UpdateStatus();
         }
 
         private void OnSpeechRecognized(object sender, SpeechRecognizedEventArgs eventArgs)
         {
+            int generation = speechRecovery.Generation;
             OnUi(delegate
             {
-                if (sender != recognizer || !acceptsCommands) { return; }
-                lastHeard = eventArgs.Result.Text;
-                if (eventArgs.Result.Confidence < MinimumConfidence)
+                if (!exiting && (cleanupBlocked || SpeechInput.CaptureBlocked || speechRecovery.RestartRequired))
                 {
+                    SetRecoveryStatus();
+                    UpdateStatus();
+                    return;
+                }
+                if (exiting || activeSetup != null || sender != recognizer || !acceptsCommands
+                    || !speechRecovery.AcceptsCallback(generation)) { return; }
+                if (modalDepth > 0)
+                {
+                    lastOutcome = English ? "Voice navigation is suspended while a dialog is open." : "La navigation vocale est suspendue pendant l’ouverture d’un dialogue.";
+                    diagnostics.Record(DiagnosticCategory.Navigation, false);
+                    UpdateStatus();
+                    return;
+                }
+                lastHeard = eventArgs.Result.Text;
+                if (!SpeechConfidence.Accept(eventArgs.Result.Grammar.Name, eventArgs.Result.Confidence))
+                {
+                    diagnostics.Record(DiagnosticCategory.Speech, false);
                     lastOutcome = English ? "Not executed: please repeat." : "Non exécuté : veuillez répéter.";
                     UpdateStatus();
                     return;
@@ -712,7 +780,7 @@ namespace JarvisPowerPoint
                 case "JarvisPrevious": return session.Previous();
                 case "JarvisGoToSlide":
                     return session.GoTo(Convert.ToInt32(result.Semantics["slideNumber"].Value, CultureInfo.InvariantCulture));
-                case "JarvisSearch": return session.Search(ExtractSearchQuery(result.Text));
+                case "JarvisSearch": return SearchWithConfirmation(ExtractSearchQuery(result.Text));
                 case "JarvisAlias":
                     string prefix = English ? "Jarvis shortcut " : "Jarvis raccourci ";
                     if (!result.Text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
@@ -742,7 +810,7 @@ namespace JarvisPowerPoint
             if (exiting || dispatcher.IsDisposed) { return; }
             if (dispatcher.InvokeRequired)
             {
-                try { dispatcher.BeginInvoke(action); }
+                try { dispatcher.BeginInvoke((Action)delegate { if (!exiting && !dispatcher.IsDisposed) action(); }); }
                 catch (InvalidOperationException)
                 {
                     if (!exiting && !dispatcher.IsDisposed) { throw; }
@@ -753,27 +821,20 @@ namespace JarvisPowerPoint
 
         private void OnAudioLevelUpdated(object sender, AudioLevelUpdatedEventArgs args)
         {
-            OnUi(delegate
+            // Coalesce SAPI's high-frequency meter events; only the UI health timer touches controls.
+            lock (audioEventGate)
             {
-                if (exiting || sender != recognizer) { return; }
-                audioLevel = args.AudioLevel;
-                UpdateStatus();
-            });
+                latestAudioSender = sender;
+                latestAudioLevel = args.AudioLevel;
+                audioEventPending = true;
+            }
         }
 
         private string ExtractSearchQuery(string recognizedText)
         {
-            string[] prefixes = currentCultureName == "en-US"
-                ? new[] { "Jarvis go to the slide about ", "Jarvis search for ", "Jarvis find " }
-                : new[]
-                {
-                    "Jarvis va au slide sur ",
-                    "Jarvis vas au slide sur ",
-                    "Jarvis cherche ",
-                    "Jarvis trouve "
-                };
-
-            string prefix = prefixes.FirstOrDefault(
+            if (string.IsNullOrWhiteSpace(recognizedText)) return string.Empty;
+            string prefix = GetSearchCommandPhrases(currentCultureName == "en-US")
+                .Select(value => "Jarvis " + value + " ").FirstOrDefault(
                 value => recognizedText.StartsWith(value, StringComparison.CurrentCultureIgnoreCase));
             return prefix == null ? string.Empty : recognizedText.Substring(prefix.Length).Trim();
         }
@@ -782,9 +843,27 @@ namespace JarvisPowerPoint
         {
             RunUiAction(delegate
             {
+                if (!listeningRequested && (cleanupBlocked || SpeechInput.CaptureBlocked || speechRecovery.RestartRequired))
+                {
+                    SetRecoveryStatus();
+                    UpdatePollingSchedule();
+                    return;
+                }
                 listeningRequested = !listeningRequested;
-                if (listeningRequested) { InitializeSpeechRecognition(); }
-                else { DisposeRecognizer(); listeningStatus = ""; }
+                if (listeningRequested) { PrepareSpeechStart(); }
+                else
+                {
+                    speechRecovery.Pause();
+                    Exception error = SpeechInputErrors.CaptureExpectedFailure(DisposeRecognizer);
+                    if (error != null)
+                    {
+                        cleanupBlocked = true;
+                        diagnostics.Record(DiagnosticCategory.Speech, false, error);
+                        lastOutcome = error.Message;
+                    }
+                    SetRecoveryStatus();
+                }
+                UpdatePollingSchedule();
             });
         }
 
@@ -792,14 +871,11 @@ namespace JarvisPowerPoint
         {
             OnUi(delegate
             {
-                if (exiting || sender != recognizer) { return; }
+                if (exiting || activeSetup != null || sender != recognizer || !speechRecovery.CanStart) { return; }
                 recognitionRunning = false;
                 acceptsCommands = false;
-                DisposeRecognizer();
-                SetUnavailable(English ? "Recognition stopped" : "Reconnaissance arrêtée",
-                    eventArgs.Error == null
-                        ? (English ? "Restart listening or check microphone setup." : "Relancez l’écoute ou vérifiez le microphone.")
-                        : eventArgs.Error.Message);
+                SpeechFailed(eventArgs.Error ?? new IOException(English ? "Recognition stopped unexpectedly."
+                    : "La reconnaissance s’est arrêtée de façon inattendue."));
             });
         }
 
@@ -816,15 +892,43 @@ namespace JarvisPowerPoint
         private void UpdateStatus()
         {
             if (exiting) { return; }
+            bool restartRequired = cleanupBlocked || SpeechInput.CaptureBlocked || speechRecovery.RestartRequired;
+            if (restartRequired)
+            {
+                acceptsCommands = false;
+                SetRecoveryStatus();
+            }
+            toggleItem.Enabled = setupItem.Enabled = !restartRequired;
+            frenchLanguageItem.Enabled = englishLanguageItem.Enabled = !restartRequired;
+            panel.SetSpeechControlsEnabled(!restartRequired);
             string language = currentCultureName == "en-US" ? "English" : "Français";
             string state = acceptsCommands ? (English ? "Listening" : "À l’écoute")
                 : listeningRequested ? (English ? "Unavailable" : "Indisponible") : (English ? "Paused" : "En pause");
-            statusItem.Text = state + " · " + language;
-            toggleItem.Text = listeningRequested ? (English ? "Pause listening" : "Mettre en pause") : (English ? "Resume listening" : "Reprendre l’écoute");
-            notifyIcon.Text = "Jarvis PowerPoint · " + state;
-            notifyIcon.Icon = acceptsCommands ? SystemIcons.Information : SystemIcons.Warning;
-            panel.SetStatus(state + " · " + language + (listeningStatus.Length == 0 ? "" : " · " + listeningStatus),
-                lastHeard, rehearsalHint.Length == 0 ? lastOutcome : rehearsalHint + " · " + lastOutcome, audioLevel);
+            if (listeningRequested && speechRecovery.State == SpeechRecoveryState.Waiting) state = English ? "Waiting" : "En attente";
+            if (listeningRequested && speechRecovery.State == SpeechRecoveryState.Recovering) state = English ? "Recovering" : "Reprise";
+            if (listeningRequested && speechRecovery.State == SpeechRecoveryState.Error) state = English ? "Error" : "Erreur";
+            if (speechRecovery.IsSuspended) state = English ? "Suspended" : "En veille";
+            if (restartRequired) state = English ? "Restart required" : "Redémarrage requis";
+            string status = state + " · " + language;
+            if (statusItem.Text != status) statusItem.Text = status;
+            string toggle = listeningRequested ? (English ? "Pause listening" : "Mettre en pause") : (English ? "Resume listening" : "Reprendre l’écoute");
+            if (toggleItem.Text != toggle) toggleItem.Text = toggle;
+            string tooltip = "Jarvis PowerPoint · " + state;
+            if (notifyIcon.Text != tooltip) notifyIcon.Text = tooltip;
+            Icon icon = acceptsCommands ? SystemIcons.Information : SystemIcons.Warning;
+            if (notifyIcon.Icon != icon) notifyIcon.Icon = icon;
+            string panelStatus = status + (listeningStatus.Length == 0 ? "" : " · " + listeningStatus);
+            string outcome = rehearsalHint.Length == 0 ? lastOutcome : rehearsalHint + " · " + lastOutcome;
+            int level = panel.Visible || panel.IndicatorEnabled ? audioLevel : 0;
+            if (previousPanelStatus != panelStatus || previousPanelHeard != lastHeard
+                || previousPanelOutcome != outcome || previousPanelLevel != level)
+            {
+                previousPanelStatus = panelStatus;
+                previousPanelHeard = lastHeard;
+                previousPanelOutcome = outcome;
+                previousPanelLevel = level;
+                panel.SetStatus(panelStatus, lastHeard, outcome, level);
+            }
         }
 
         private void UpdateLanguageMenu()
@@ -837,6 +941,7 @@ namespace JarvisPowerPoint
             toolsItem.Text = English ? "Presenter tools..." : "Outils présentateur...";
             setupItem.Text = English ? "Language and microphone..." : "Langue et microphone...";
             panel.SetLanguage(English);
+            UpdateEnhancementLanguage();
         }
 
         private string GetCommandHelp()
@@ -890,6 +995,8 @@ namespace JarvisPowerPoint
         private void SetUnavailable(string status, string details)
         {
             acceptsCommands = false;
+            speechRecovery.Fail(clock.Elapsed, false);
+            diagnostics.Record(DiagnosticCategory.Speech, false);
             listeningStatus = status;
             lastOutcome = details;
             toggleItem.Enabled = true;
@@ -908,44 +1015,63 @@ namespace JarvisPowerPoint
 
         private void ExitApplication(object sender, EventArgs eventArgs)
         {
+            if (exiting) { return; }
+            if (!PrepareToExit()) { return; }
             exiting = true;
-            if (activeSetup != null) { activeSetup.Close(); }
-            Application.Idle -= OnFirstIdle;
-            presentationTimer.Stop();
-            presentationTimer.Dispose();
-            notifyIcon.Visible = false;
-            DisposeRecognizer();
-            panel.Dispose();
-            dispatcher.Dispose();
-            notifyIcon.Dispose();
-            ExitThread();
+            StopSpeechRecovery();
+            try { session.Dispose(); }
+            finally
+            {
+                if (activeSetup != null) { activeSetup.Close(); }
+                Application.Idle -= OnFirstIdle;
+                presentationTimer.Stop();
+                presentationTimer.Dispose();
+                notifyIcon.Visible = false;
+                try { DisposeRecognizer(); }
+                finally
+                {
+                    try { hotkeys.Dispose(); }
+                    finally
+                    {
+                        panel.Dispose();
+                        dispatcher.Dispose();
+                        notifyIcon.Dispose();
+                        ExitThread();
+                    }
+                }
+            }
         }
 
         private void DisposeRecognizer()
         {
             acceptsCommands = false;
             audioLevel = 0;
+            lastAudioUtc = DateTime.MinValue;
             SpeechRecognitionEngine oldRecognizer = recognizer;
             recognizer = null;
-            if (oldRecognizer == null)
+            IDisposable oldInput = microphoneInput;
+            microphoneInput = null;
+            recognitionRunning = false;
+            lock (audioEventGate)
             {
-                return;
+                latestAudioSender = null;
+                audioEventPending = false;
             }
-
-            oldRecognizer.SpeechRecognized -= OnSpeechRecognized;
-            oldRecognizer.RecognizeCompleted -= OnRecognitionCompleted;
-            oldRecognizer.AudioLevelUpdated -= OnAudioLevelUpdated;
-            try
+            if (oldRecognizer != null)
             {
-                IDisposable oldInput = microphoneInput;
-                microphoneInput = null;
-                if (oldInput != null) { oldInput.Dispose(); }
+                oldRecognizer.SpeechRecognized -= OnSpeechRecognized;
+                oldRecognizer.RecognizeCompleted -= OnRecognitionCompleted;
+                oldRecognizer.AudioLevelUpdated -= OnAudioLevelUpdated;
             }
-            finally
-            {
-                oldRecognizer.Dispose();
-                recognitionRunning = false;
-            }
+            SpeechInputErrors.DisposeCapture(
+                delegate { if (oldInput != null) oldInput.Dispose(); },
+                delegate
+                {
+                    if (oldRecognizer == null) return;
+                    try { oldRecognizer.RecognizeAsyncCancel(); }
+                    catch (InvalidOperationException) { } // Startup may have failed before listening began.
+                },
+                delegate { if (oldRecognizer != null) oldRecognizer.Dispose(); });
         }
     }
 
@@ -1005,6 +1131,18 @@ namespace JarvisPowerPoint
             int remainder = number % 100;
             string prefix = EnglishUnits[hundreds] + " hundred";
             return remainder == 0 ? prefix : prefix + " " + EnglishUnderOneHundred(remainder);
+        }
+
+        public static string ToBelgianFrench(int number)
+        {
+            if (number < 1 || number > 999) throw new ArgumentOutOfRangeException("number");
+            int remainder = number % 100;
+            if (remainder < 70 || (remainder >= 80 && remainder < 90)) return ToFrench(number);
+            string tens = remainder < 80 ? "septante" : "nonante";
+            int units = remainder % 10;
+            string tail = tens + (units == 0 ? "" : (units == 1 ? " et " : " ") + FrenchUnits[units]);
+            int hundreds = number / 100;
+            return hundreds == 0 ? tail : (hundreds == 1 ? "cent" : FrenchUnits[hundreds] + " cent") + " " + tail;
         }
 
         private static string FrenchUnderOneHundred(int number)
@@ -1219,9 +1357,8 @@ namespace JarvisPowerPoint
             }
         }
 
-        internal static List<SlideSearchResult> FindSlides(PowerPoint.Slides slides, string query)
+        internal static string[] GetSearchWords(string normalizedQuery)
         {
-            string normalizedQuery = NormalizeForSearch(query);
             string[] queryWords = normalizedQuery
                 .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)
                 .Where(word => !SearchStopWords.Contains(word))
@@ -1232,6 +1369,13 @@ namespace JarvisPowerPoint
                 queryWords = normalizedQuery
                     .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
             }
+            return queryWords;
+        }
+
+        internal static List<SlideSearchResult> FindSlides(PowerPoint.Slides slides, string query)
+        {
+            string normalizedQuery = NormalizeForSearch(query);
+            string[] queryWords = GetSearchWords(normalizedQuery);
             var results = new List<SlideSearchResult>();
 
             for (int index = 1; index <= slides.Count; index++)
@@ -1300,141 +1444,9 @@ namespace JarvisPowerPoint
             }
         }
 
-        private static string GetSlideText(PowerPoint.Slide slide)
+        internal static string GetSlideText(PowerPoint.Slide slide)
         {
-            PowerPoint.Shapes shapes = null;
-            var text = new StringBuilder();
-
-            try
-            {
-                shapes = slide.Shapes;
-                for (int index = 1; index <= shapes.Count; index++)
-                {
-                    PowerPoint.Shape shape = null;
-                    try
-                    {
-                        shape = shapes[index];
-                        AppendShapeText(shape, text);
-                    }
-                    finally
-                    {
-                        ReleaseComObject(shape);
-                    }
-                }
-            }
-            finally
-            {
-                ReleaseComObject(shapes);
-            }
-
-            return text.ToString();
-        }
-
-        private static void AppendShapeText(PowerPoint.Shape shape, StringBuilder text)
-        {
-            if (shape.Type == Office.MsoShapeType.msoGroup)
-            {
-                PowerPoint.GroupShapes groupItems = null;
-                try
-                {
-                    groupItems = shape.GroupItems;
-                    for (int index = 1; index <= groupItems.Count; index++)
-                    {
-                        PowerPoint.Shape groupShape = null;
-                        try
-                        {
-                            groupShape = (PowerPoint.Shape)groupItems[index];
-                            AppendShapeText(groupShape, text);
-                        }
-                        finally
-                        {
-                            ReleaseComObject(groupShape);
-                        }
-                    }
-                }
-                finally
-                {
-                    ReleaseComObject(groupItems);
-                }
-            }
-
-            if (shape.HasTextFrame == Office.MsoTriState.msoTrue)
-            {
-                PowerPoint.TextFrame textFrame = null;
-                PowerPoint.TextRange textRange = null;
-                try
-                {
-                    textFrame = shape.TextFrame;
-                    if (textFrame.HasText == Office.MsoTriState.msoTrue)
-                    {
-                        textRange = textFrame.TextRange;
-                        text.Append(' ').Append(textRange.Text);
-                    }
-                }
-                finally
-                {
-                    ReleaseComObject(textRange);
-                    ReleaseComObject(textFrame);
-                }
-            }
-
-            if (shape.HasTable == Office.MsoTriState.msoTrue)
-            {
-                AppendTableText(shape, text);
-            }
-
-            if (!string.IsNullOrWhiteSpace(shape.AlternativeText))
-            {
-                text.Append(' ').Append(shape.AlternativeText);
-            }
-        }
-
-        private static void AppendTableText(PowerPoint.Shape shape, StringBuilder text)
-        {
-            PowerPoint.Table table = null;
-            PowerPoint.Rows rows = null;
-            PowerPoint.Columns columns = null;
-
-            try
-            {
-                table = shape.Table;
-                rows = table.Rows;
-                columns = table.Columns;
-                for (int row = 1; row <= rows.Count; row++)
-                {
-                    for (int column = 1; column <= columns.Count; column++)
-                    {
-                        PowerPoint.Cell cell = null;
-                        PowerPoint.Shape cellShape = null;
-                        PowerPoint.TextFrame textFrame = null;
-                        PowerPoint.TextRange textRange = null;
-                        try
-                        {
-                            cell = table.Cell(row, column);
-                            cellShape = cell.Shape;
-                            textFrame = cellShape.TextFrame;
-                            if (textFrame.HasText == Office.MsoTriState.msoTrue)
-                            {
-                                textRange = textFrame.TextRange;
-                                text.Append(' ').Append(textRange.Text);
-                            }
-                        }
-                        finally
-                        {
-                            ReleaseComObject(textRange);
-                            ReleaseComObject(textFrame);
-                            ReleaseComObject(cellShape);
-                            ReleaseComObject(cell);
-                        }
-                    }
-                }
-            }
-            finally
-            {
-                ReleaseComObject(columns);
-                ReleaseComObject(rows);
-                ReleaseComObject(table);
-            }
+            return PowerPointSearchText.ReadAll(slide);
         }
 
         private static int ScoreSlide(
@@ -1445,7 +1457,12 @@ namespace JarvisPowerPoint
         {
             string normalizedTitle = NormalizeForSearch(title);
             string normalizedContent = NormalizeForSearch(content);
+            return ScoreNormalizedSlide(normalizedTitle, normalizedContent, normalizedQuery, queryWords);
+        }
 
+        internal static int ScoreNormalizedSlide(
+            string normalizedTitle, string normalizedContent, string normalizedQuery, string[] queryWords)
+        {
             if (normalizedTitle == normalizedQuery)
             {
                 return 1000;
@@ -1579,7 +1596,8 @@ namespace JarvisPowerPoint
         {
             if (value != null && Marshal.IsComObject(value))
             {
-                Marshal.FinalReleaseComObject(value);
+                // Search cursors may retain another reference to this RCW between STA ticks.
+                Marshal.ReleaseComObject(value);
             }
         }
 

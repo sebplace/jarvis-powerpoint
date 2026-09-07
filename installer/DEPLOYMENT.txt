@@ -1,0 +1,218 @@
+Jarvis PowerPoint 1.5 - managed Windows deployment
+================================================
+
+Scope
+-----
+The MSI is a per-machine, all-users Windows Installer package. It installs
+JarvisPowerPoint.exe, the MIT license, and JarvisPowerPoint.managed under:
+  [ProgramFilesFolder]\Jarvis PowerPoint
+On 64-bit Windows this is normally C:\Program Files (x86)\Jarvis PowerPoint.
+It creates one advertised all-users Start menu shortcut. It never launches
+Jarvis (including under SYSTEM), installs startup tasks/services/drivers, kills
+PowerPoint/Jarvis, downloads prerequisites, or changes application settings.
+There is no custom setup wizard or application auto-launch; managed silent
+deployment is the intended entry point. Interactive installation is unvalidated.
+
+Architecture and prerequisites
+------------------------------
+The package platform is x86 (Intel); the executable remains .NET Framework
+AnyCPU, not an x86-only or native ARM64 build. Its CLR process architecture
+follows the installed runtime/OS. Intended deployment is serviced Windows 10
+(x86/x64, with applicable extended support) or Windows 11 (x64), with .NET
+Framework 4.8 or later. The MSI checks the Full framework Release DWORD in
+the 32-bit registry view (>= 528040), rejecting bare .NET Framework 4.0 and
+earlier 4.x releases. The CLR v4 designation alone is not sufficient.
+Maintenance/uninstall is exempt so a broken prerequisite does not prevent
+removal. Only the runtime is required, not the .NET SDK. PowerPoint need not
+be open or even installed while the MSI installs.
+
+At runtime, interactive desktop PowerPoint and its .NET/Office interop
+assemblies, Windows speech components, an installed matching speech
+recognizer, microphone access and the user's presentation are required.
+Install .NET/Office/speech prerequisites separately through IT. Test the
+organization's actual Office architecture and deployment configuration.
+ARM64 Windows/emulated Office/runtime combinations are not validated; this
+package does not claim native ARM64 support. Exclude ARM64 in deployment
+requirements until IT validates that exact combination.
+
+Local build (no installation or publication)
+------------------------------------------
+  .\build.ps1 -OutputDirectory <absolute-candidate-directory>
+  .\build-msi.ps1 -Executable <absolute-path-to-JarvisPowerPoint.exe>
+
+The MSI defaults to bin\msi\JarvisPowerPoint-1.5.0-x86.msi, with a .msi.json
+sidecar containing identifiers and hashes. The build refuses a payload whose
+file version is not exactly 1.5.0.0. WiX compilation and ICE validation are
+enabled by default, with warnings treated as errors. Some managed build hosts
+block the ICE validator's Windows Installer execution (WiX LGHT1105). Do not
+elevate or change policy to work around that. On such a host explicitly use
+-SkipIceValidation for authoring-only output, run the read-only table/payload
+checks, and run full ICE validation later on an approved build machine. The
+sidecar records this validation gap; skipping a validator does not approve the
+artifact for release and does not change or bypass Windows execution policy.
+
+WiX 3.14.1.8722 is pinned for this SDK-free .NET Framework build. If it is not
+installed, build-msi.ps1 fails with an actionable error. Run
+  .\installer\Restore-Wix.ps1
+to download the official standalone archive over HTTPS into installer\.tools,
+verify its pinned SHA-256, and extract locally. No global tool installation,
+SDK, PATH, trust store, or execution policy changes are made. WiX 3 is a legacy
+toolchain: IT/release engineering should review its support policy and plan a
+separately validated WiX upgrade rather than silently changing build tools.
+
+Release identity
+----------------
+Version:      1.5.0 (application 1.5.0.0)
+ProductCode:  {B39CDD36-C72B-41A6-9CE2-E3D59B53EB21}
+UpgradeCode:  {67968489-B73D-4544-9BFD-843D8040D847}
+
+installer\release.json owns the version-specific ProductCode and stable
+UpgradeCode. Product.wxs owns the stable component GUIDs. Keep UpgradeCode/component
+GUIDs/paths stable for this x86 product family; for each future major-upgrade
+release change the first three version fields and assign a NEW ProductCode.
+Do not ship different payloads under an already released ProductCode/version.
+PackageCode is regenerated per build. Keep the fourth executable version
+field zero: MSI ignores it for upgrade comparisons.
+
+Newer installed versions block older installers. Equal version/ProductCode
+is maintenance, not a replacement release. Major upgrade removes the older
+product inside the installation transaction so rollback can restore it if
+the new installation fails. Per-user application settings, aliases, profiles,
+reports, and updater backups are not MSI components and are left untouched
+by repair, uninstall, and major upgrade. An existing portable copy or its
+per-user shortcut is not migrated/deleted; IT should explain which shortcut
+users should open and retire portable copies separately if appropriate.
+
+Intune / software management examples
+-------------------------------------
+Intune supports this MSI as a Windows line-of-business app. For richer
+requirements, detection, dependencies and supersedence, prefer wrapping it
+as .intunewin with Microsoft's existing Win32 content prep tooling and deploy
+through the Intune Management Extension. Avoid mixing LOB and Win32 app
+installations during classic Windows Autopilot enrollment. Use silent,
+noninteractive installation. Install behavior: System. Elevation belongs to
+the management agent/Windows Installer, never to Jarvis; do not launch Jarvis
+as SYSTEM. Exclude ARM64 from requirements.
+Use separate prerequisites for .NET 4.8 and Office; no connected presentation
+is an installation requirement.
+
+Microsoft deployment guidance:
+  https://learn.microsoft.com/en-us/intune/app-management/deployment/win32
+  https://learn.microsoft.com/en-us/intune/app-management/deployment/add-lob-windows
+
+Install:
+  msiexec.exe /i "JarvisPowerPoint-1.5.0-x86.msi" /qn /norestart /l*v "C:\YourManagedLogFolder\Jarvis-install.log"
+Repair:
+  msiexec.exe /fa {B39CDD36-C72B-41A6-9CE2-E3D59B53EB21} /qn /norestart /l*v "C:\YourManagedLogFolder\Jarvis-repair.log"
+Uninstall:
+  msiexec.exe /x {B39CDD36-C72B-41A6-9CE2-E3D59B53EB21} /qn /norestart /l*v "C:\YourManagedLogFolder\Jarvis-uninstall.log"
+
+Create the approved log directory before invoking msiexec. Logs may contain
+machine paths; retain/share them only according to organizational policy.
+Never run these commands on a live machine simply to validate a build.
+
+Detection: Intune MSI product-code detection with the ProductCode above;
+optionally require MSI version >= 1.5.0. Update detection to each new release
+ProductCode and configure supersedence for old releases. Do not use Win32_Product
+inventory queries (they can trigger repairs). Alternative inventory: read
+HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\<ProductCode> in the
+32-bit registry view and check DisplayVersion; verify the deployment
+InstallPath/Version under HKLM\Software\JarvisPowerPoint\Deployment in the
+32-bit view (WOW6432Node on x64). Use registry-view APIs rather than assuming
+the management agent's process bitness. A file-only rule can mistake a portable
+copy for an installed product and is not recommended.
+
+Exit codes: 0 = success; 3010 = success, reboot required; 1641 = success with
+reboot initiated (not expected with this package and /norestart); 1618 =
+another installation in progress, retry; 1602 = cancelled; 1603 = fatal failure
+(including failed launch condition); other nonzero values require log review.
+Map 3010 to soft reboot, 1641 to hard reboot, and 1618 to retry in Intune.
+
+Files in use: Restart Manager shutdown/relaunch is disabled; no process is
+forcibly terminated. Close Jarvis voluntarily before repair/upgrade/uninstall.
+Windows Installer may defer locked-file operations and return 3010; schedule
+a managed reboot before claiming the new bits are active. This package does
+not bypass file locks or promise reboot-free servicing.
+
+Managed application behavior
+----------------------------
+ManagedDeployment.IsManaged / IsManagedExecutable(path) recognize an adjacent
+JarvisPowerPoint.managed marker, the protected default install directory, or
+an exact matching HKLM Deployment\InstallPath in either registry view. A
+registration for one directory does not disable an unrelated portable copy.
+Existing directory paths are resolved through Windows handles, including
+short names and directory aliases, before comparing installation registration.
+If marker/registry inspection is denied, updates fail closed.
+
+An optional IT policy is:
+  HKLM\Software\Policies\JarvisPowerPoint
+  DisablePortableUpdates (REG_DWORD) = 1
+Read from both 32/64-bit views; either enabled value takes precedence. Unlike
+the path-bound MSI registration, this deliberately disables the portable
+updater and optional per-user shortcut changes for ALL Jarvis copies. MSI
+does not create, remove, or override this IT-owned policy.
+
+The managed update dialog shows an IT servicing message without contacting
+GitHub. StartMenuShortcut.Configure exits without prompting or writing HKCU.
+Update checks/preparation/helper launch/final authorization validate managed
+status; helper manifests and the final replace transaction independently
+check the TARGET path (not just the helper's staging directory). A policy or
+marker appearing while the helper waits also blocks replacement/restart.
+No MSI self-updating is implemented.
+
+Authenticode signing (optional; existing certificate only)
+--------------------------------------------------------
+Unsigned output is a test artifact, not a claim of trusted enterprise release.
+Actual trusted signing requires release engineering's already-issued
+code-signing certificate with accessible private key and existing Windows SDK
+signing tool. The local implementation check found neither an eligible
+certificate in the personal certificate stores nor SignTool on PATH or in the
+standard Windows 10 SDK bin directory; its MSI remains unsigned.
+The scripts never buy/request certificates, import/export private keys, change
+trust, or request policy bypasses. Respect the organization's signing service
+and key-access approvals.
+
+Required order:
+  1. Build and test the candidate EXE.
+  2. Sign the EXE using sign-release.ps1 with an existing certificate.
+  3. Build the MSI from that signed EXE (signing changes the payload hash).
+  4. Sign the MSI; do not edit it afterward.
+  5. Validate/extract the final signed MSI and independently verify both
+     signatures on representative managed machines. Retain final hashes.
+
+Example (substitute existing certificate/tool/provider values):
+  .\sign-release.ps1 -Files <candidate-exe> -CertificateThumbprint <40-hex-thumbprint> -TimestampUrl <provider-https-rfc3161-url> -SignToolPath <existing-signtool.exe>
+  .\build-msi.ps1 -Executable <candidate-exe>
+  .\sign-release.ps1 -Files <built-msi> -CertificateThumbprint <40-hex-thumbprint> -TimestampUrl <provider-https-rfc3161-url> -SignToolPath <existing-signtool.exe>
+
+The script requires SHA-256 file and RFC3161 timestamp digests, verifies all
+signatures with Authenticode policy and timestamp warnings, then requires
+Valid trust status, the expected signer thumbprint, and a timestamp certificate.
+Signing failures stop the process: do not distribute partially signed artifacts.
+When signing an MSI its hash/signature sidecar is refreshed. Rebuilding after
+MSI signing invalidates that release artifact; sign the rebuilt MSI again.
+Public portable updates currently verify GitHub's digest/version, not publisher
+trust. Signing does not bypass WDAC/AppLocker or guarantee SmartScreen reputation,
+absence of warnings, or organizational approval.
+
+Validation boundaries
+---------------------
+  .\tests\Installer.Tests.ps1 -Msi <built-msi> -Executable <candidate-exe>
+checks MSI tables, metadata, rollback/upgrade/repair/uninstall action contracts,
+and creates an administrative image inside project test fixtures. It compares
+the extracted EXE hash and verifies that the real product's install state and
+source EXE are unchanged. It does NOT install, repair, remove, or upgrade the
+real product. Updater tests cover direct helper attempts against managed files.
+Run tests\ReleaseBuild.Tests.ps1 for offline architecture/version rejection and
+signing-input preflight checks, and tests\StartMenuShortcut.Tests.ps1 with
+-Executable <candidate-exe> for isolated shortcut/managed-directory-alias checks.
+Use an IT-approved PowerShell build host. If script execution is blocked by
+host policy, stop; do not change policy or use execution-policy bypass.
+
+Before production approval, use an isolated disposable Windows VM with the
+organization's actual policies to verify: clean install /qn, advertised shortcut,
+repair after deleting installed files, uninstall, 1.5-to-next major upgrade,
+downgrade rejection, failed-upgrade rollback, files-in-use and 3010 handling,
+standard-user startup/managed UI, x86/x64 Office prerequisites, and signed
+publisher/WDAC/Intune policy behavior. No such full machine lifecycle test is
+claimed by the local administrative-image checks.

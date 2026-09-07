@@ -1,0 +1,9 @@
+{
+  "version": "1.5.0",
+  "productCode": "{B39CDD36-C72B-41A6-9CE2-E3D59B53EB21}",
+  "upgradeCode": "{67968489-B73D-4544-9BFD-843D8040D847}",
+  "architecture": "x86",
+  "wixVersion": "3.14.1.8722",
+  "wixArchiveUrl": "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip",
+  "wixArchiveSha256": "6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31"
+}

@@ -7,7 +7,7 @@ $executable = [IO.Path]::GetFullPath($Executable)
 $assembly = [Reflection.Assembly]::LoadFrom($executable)
 $shortcutType = $assembly.GetType("JarvisPowerPoint.StartMenuShortcut", $true)
 $id = [Guid]::NewGuid().ToString("N")
-$tempDirectory = Join-Path ([IO.Path]::GetTempPath()) "Jarvis Shortcut Tests $id"
+$tempDirectory = Join-Path $PSScriptRoot ".shortcut-fixtures-$id"
 $registrySubKey = "Software\JarvisPowerPoint.Tests\$id"
 $settingsKey = "HKEY_CURRENT_USER\$registrySubKey"
 $script:promptCount = 0
@@ -122,6 +122,25 @@ try {
     Assert-True $failed "Missing executable must fail, not create a broken shortcut."
     Assert-True (-not (Test-Path -LiteralPath $missing.ShortcutPath)) "Missing executable created a broken shortcut."
     Assert-True ($null -eq [Microsoft.Win32.Registry]::GetValue($missingKey, "StartMenuShortcutPrompted", $null)) "Missing executable failure incorrectly marked the prompt handled."
+
+    $managedKey = "$settingsKey\Managed"
+    $managed = New-ShortcutManager (Join-Path $tempDirectory "Managed Programs") $movedTarget $managedKey
+    Set-Content -LiteralPath (Join-Path $movedFolder "JarvisPowerPoint.managed") -Value "managed fixture"
+    Assert-True ($managed.Configure($unexpectedPrompt, $false).ToString() -eq "NotNeeded") "Managed startup must not prompt."
+    Assert-True ($managed.Configure($unexpectedPrompt, $true).ToString() -eq "NotNeeded") "Managed menu must not mutate shortcuts."
+    Assert-True (-not (Test-Path -LiteralPath $managed.ShortcutPath)) "Managed install created a per-user shortcut."
+    Assert-True ($null -eq [Microsoft.Win32.Registry]::GetValue($managedKey, "StartMenuShortcutPrompted", $null)) "Managed guard mutated user preference."
+
+    $alias = Join-Path $tempDirectory "Directory alias"
+    New-Item -ItemType Junction -Path $alias -Target $movedFolder | Out-Null
+    try {
+        $managedType = $assembly.GetType("JarvisPowerPoint.ManagedDeployment", $true)
+        $matches = $managedType.GetMethod("MatchesInstallPath", [Reflection.BindingFlags]"Static,NonPublic")
+        Assert-True ($matches.Invoke($null, @([string]$alias, [string]$movedFolder))) "Directory alias evades path-bound registration."
+        Assert-True ($managedType.GetMethod("IsManagedExecutable").Invoke($null, @([string](Join-Path $alias "JarvisPowerPoint.exe")))) "Directory alias evades managed marker."
+        $aliasManager = New-ShortcutManager (Join-Path $tempDirectory "Alias Programs") (Join-Path $alias "JarvisPowerPoint.exe") "$managedKey\Alias"
+        Assert-True ($aliasManager.Configure($unexpectedPrompt, $true).ToString() -eq "NotNeeded") "Managed directory alias mutated shortcuts."
+    } finally { [IO.Directory]::Delete($alias) }
 
     Write-Host "Passed $assertions shortcut assertions."
 } finally {

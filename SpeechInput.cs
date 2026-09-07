@@ -30,6 +30,39 @@ namespace JarvisPowerPoint
 
     internal static class SpeechInput
     {
+        private static Exception captureFailure;
+        internal static bool CaptureBlocked { get { return Interlocked.CompareExchange(ref captureFailure, null, null) != null; } }
+
+        internal static void EnsureCaptureAvailable()
+        {
+            Exception error = Interlocked.CompareExchange(ref captureFailure, null, null);
+            if (error != null)
+                throw new IOException(RestartRequiredMessage(true), error);
+        }
+
+        internal static string RestartRequiredMessage(bool english)
+        {
+            return english
+                ? "Microphone cleanup failed. Cancel setup, quit Jarvis completely, check the device, then restart Jarvis manually. "
+                    + "No new capture or settings save is allowed until restart."
+                : "Échec de libération du microphone. Annulez la configuration, quittez complètement Jarvis, vérifiez le périphérique, "
+                    + "puis redémarrez Jarvis manuellement. Toute nouvelle écoute ou sauvegarde des réglages est bloquée jusqu’au redémarrage.";
+        }
+
+        internal static SpeechCleanupException BlockCaptureFailure(Exception failure)
+        {
+            var error = new SpeechCleanupException(RestartRequiredMessage(true), failure);
+            Interlocked.CompareExchange(ref captureFailure, error, null);
+            return error;
+        }
+
+        private static SpeechCleanupException BlockCapture(string message)
+        {
+            var error = new SpeechCleanupException(message);
+            Interlocked.CompareExchange(ref captureFailure, error, null);
+            return error;
+        }
+
         public static IList<AudioInputDevice> GetDevices()
         {
             var devices = new List<AudioInputDevice>();
@@ -49,6 +82,7 @@ namespace JarvisPowerPoint
         public static IDisposable Attach(SpeechRecognitionEngine engine, string deviceId)
         {
             if (engine == null) throw new ArgumentNullException("engine");
+            EnsureCaptureAvailable();
             if (deviceId == "default")
             {
                 engine.SetInputToDefaultAudioDevice();
@@ -63,9 +97,9 @@ namespace JarvisPowerPoint
                     new SpeechAudioFormatInfo(16000, AudioBitsPerSample.Sixteen, AudioChannel.Mono));
                 return input;
             }
-            catch
+            catch (Exception failure)
             {
-                SpeechInputErrors.CleanupPreservingFailure(input.Dispose);
+                SpeechInputErrors.CleanupPreservingFailure(input.Dispose, failure);
                 throw;
             }
         }
@@ -140,6 +174,7 @@ namespace JarvisPowerPoint
             private readonly NativeBuffer[] buffers = new NativeBuffer[BufferCount];
             private IntPtr handle;
             private Exception startupError;
+            private Exception cleanupError;
             private bool startupFinished;
             private int disposed;
             private int level;
@@ -194,6 +229,7 @@ namespace JarvisPowerPoint
                 bool started = false;
                 try
                 {
+                    EnsureCaptureAvailable();
                     var format = new WaveInNative.Format();
                     format.FormatTag = 1;
                     format.Channels = 1;
@@ -284,7 +320,16 @@ namespace JarvisPowerPoint
                 {
                     // Publish startup failures before cleanup so the constructor can begin disposal.
                     if (!started) SignalStartup();
-                    try { ReleaseNativeResources(); }
+                    try
+                    {
+                        Exception failure = SpeechInputErrors.CaptureExpectedFailure(ReleaseNativeResources);
+                        if (failure != null)
+                        {
+                            cleanupError = BlockCaptureFailure(failure);
+                            stream.Fail(cleanupError);
+                            Trace.TraceError("{0}", cleanupError);
+                        }
+                    }
                     finally { stop.Dispose(); }
                 }
             }
@@ -316,10 +361,10 @@ namespace JarvisPowerPoint
                                 WaveInNative.HeaderSize), "release microphone buffer");
                     }
                     uint result = WaveInNative.waveInClose(handle);
-                    // A failed close must not free memory still owned by a driver. Retain ownership
-                    // on this background worker and retry; Dispose has a bounded wait and reports
-                    // a driver that cannot release its handle. INVALHANDLE means it is already gone.
-                    while (result != 0 && result != 5)
+                    // A failed close must not free memory still owned by a driver. Retry finitely,
+                    // then retain that native allocation until process exit and block new captures.
+                    // INVALHANDLE means the handle is already gone.
+                    for (int retry = 0; result != 0 && result != 5 && retry < 20; retry++)
                     {
                         ReportCleanupError(result, "close microphone");
                         WaveInNative.waveInReset(handle);
@@ -328,6 +373,15 @@ namespace JarvisPowerPoint
                                 WaveInNative.waveInUnprepareHeader(handle, buffer.Header, WaveInNative.HeaderSize);
                         Thread.Sleep(100);
                         result = WaveInNative.waveInClose(handle);
+                    }
+                    if (result != 0 && result != 5)
+                    {
+                        cleanupError = BlockCapture("The microphone driver did not release its handle "
+                            + "after bounded cleanup. Audio delivery is stopped. Restart Jarvis manually after "
+                            + "checking the device; another capture must not be opened.");
+                        stream.Fail(cleanupError);
+                        Trace.TraceError("{0}", cleanupError);
+                        return;
                     }
                     ReportCleanupError(result, "close microphone");
                     handle = IntPtr.Zero;
@@ -351,12 +405,13 @@ namespace JarvisPowerPoint
                 bool released = worker.Join(3000);
                 if (!released)
                 {
-                    var error = new IOException("The microphone driver did not stop within three seconds. "
-                        + "Audio delivery has stopped; driver cleanup continues in the background. "
-                        + "Reconnect the device or restart Windows if it remains busy.");
+                    var error = BlockCapture("The microphone driver did not stop within three seconds. "
+                        + "Audio delivery has stopped; no new capture is safe. Restart Jarvis manually after "
+                        + "checking the device or restart Windows if it remains busy.");
                     stream.Fail(error);
                     throw error;
                 }
+                if (cleanupError != null) throw cleanupError;
             }
 
             private sealed class NativeBuffer : IDisposable
@@ -389,8 +444,25 @@ namespace JarvisPowerPoint
         }
     }
 
+    internal sealed class SpeechCleanupException : IOException
+    {
+        public SpeechCleanupException(string message) : base(message) { }
+        public SpeechCleanupException(string message, Exception innerException) : base(message, innerException) { }
+    }
+
     internal static class SpeechInputErrors
     {
+        public static bool HasUnsafeCleanup(Exception error)
+        {
+            if (error == null) return false;
+            if (error is SpeechCleanupException) return true;
+            var aggregate = error as AggregateException;
+            if (aggregate != null)
+                foreach (Exception nested in aggregate.InnerExceptions)
+                    if (HasUnsafeCleanup(nested)) return true;
+            return HasUnsafeCleanup(error.InnerException);
+        }
+
         public static Exception CaptureExpectedFailure(Action operation)
         {
             try { operation(); return null; }
@@ -405,12 +477,44 @@ namespace JarvisPowerPoint
             catch (BadImageFormatException error) { return error; }
         }
 
-        public static void CleanupPreservingFailure(Action cleanup)
+        public static void CleanupPreservingFailure(Action cleanup, Exception primaryFailure = null)
         {
             // Called only from a cleanup-and-rethrow catch. A teardown error must not
-            // replace the startup/attachment error that is already being propagated.
+            // replace the startup/attachment error; unsafe native ownership must also reach recovery.
             Exception error = CaptureExpectedFailure(cleanup);
+            if (HasUnsafeCleanup(error))
+            {
+                throw new IOException("Speech attachment failed and the microphone driver could not be released.",
+                    primaryFailure == null ? error : new AggregateException(primaryFailure, error));
+            }
             if (error != null) Trace.TraceError("Local speech cleanup also failed: {0}", error);
+        }
+
+        public static void DisposeCapture(Action releaseInput, Action cancelRecognition, Action releaseRecognizer)
+        {
+            var failures = new List<Exception>();
+            try
+            {
+                Exception failure = CaptureExpectedFailure(releaseInput);
+                if (failure != null) failures.Add(failure);
+            }
+            finally
+            {
+                try
+                {
+                    Exception failure = CaptureExpectedFailure(cancelRecognition);
+                    if (failure != null) failures.Add(failure);
+                }
+                finally
+                {
+                    Exception failure = CaptureExpectedFailure(releaseRecognizer);
+                    if (failure != null) failures.Add(failure);
+                    // Failed teardown cannot establish that SAPI (including its default input)
+                    // or a native driver has relinquished capture ownership.
+                    if (failures.Count != 0)
+                        throw SpeechInput.BlockCaptureFailure(new AggregateException(failures));
+                }
+            }
         }
     }
 

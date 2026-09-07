@@ -10,25 +10,29 @@ namespace JarvisPowerPoint
     {
         private readonly TabControl tabs = new TabControl { Dock = DockStyle.Fill };
         private readonly Label status = new Label { AutoSize = true };
-        private readonly Label heard = new Label { AutoSize = true, MaximumSize = new Size(600, 0) };
-        private readonly Label outcome = new Label { AutoSize = true, MaximumSize = new Size(600, 0) };
+        private readonly Label heard = new Label { AutoSize = true };
+        private readonly Label outcome = new Label { AutoSize = true };
         private readonly Label presentation = new Label { AutoSize = true };
         private readonly ProgressBar audioLevel = new ProgressBar { Width = 300 };
         private readonly ComboBox displays = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 470 };
         private readonly CheckBox indicatorEnabled = new CheckBox { AutoSize = true };
-        private readonly Label privacy = new Label { AutoSize = true, MaximumSize = new Size(590, 0), ForeColor = Color.Maroon };
-        private readonly ListView aliasList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, MultiSelect = false };
+        private readonly CheckBox cautiousSearch = new CheckBox { AutoSize = true, Checked = true };
+        private readonly CheckBox hotkeysEnabled = new CheckBox { AutoSize = true };
+        private readonly Label privacy = new Label { AutoSize = true };
+        private readonly ListView aliasList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, MultiSelect = false, HideSelection = false, ShowItemToolTips = true };
         private readonly TextBox aliasInput = new TextBox { Width = 240, MaxLength = 80 };
-        private readonly ListView rehearsalList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, MultiSelect = false };
+        private readonly ListView rehearsalList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, MultiSelect = false, HideSelection = false, ShowItemToolTips = true };
         private readonly NumericUpDown budget = new NumericUpDown { Minimum = 1, Maximum = 3600, Value = 90, Width = 80 };
         private readonly Label rehearsalSummary = new Label { AutoSize = true };
         private readonly Dictionary<Button, string[]> buttonTexts = new Dictionary<Button, string[]>();
         private readonly ToolTip tooltips = new ToolTip();
         private readonly ListeningIndicator indicator = new ListeningIndicator();
-        private readonly Label aliasHelp = new Label { AutoSize = true, MaximumSize = new Size(600, 0) };
+        private readonly Label aliasHelp = new Label { AutoSize = true };
         private readonly Label budgetHelp = new Label { AutoSize = true };
         private readonly Button startRehearsal;
         private readonly Button stopRehearsal;
+        private readonly Button listenButton;
+        private readonly Button microphoneSetupButton;
         private bool english;
 
         public event EventHandler PauseRequested;
@@ -46,11 +50,22 @@ namespace JarvisPowerPoint
         public event EventHandler SaveAliasRequested;
         public event EventHandler DeleteAliasRequested;
         public event EventHandler NavigateAliasRequested;
+        public event EventHandler ProfilesRequested;
+        public event EventHandler PreflightRequested;
+        public event EventHandler DiagnosticsRequested;
+        public event EventHandler UpdatesRequested;
+        public event EventHandler SaveRehearsalRequested;
+        public event EventHandler CautiousSearchChanged;
+        public event EventHandler HotkeysChanged;
 
         public string AliasNameInput { get { return aliasInput.Text.Trim(); } }
         public string SelectedAliasName { get { return aliasList.SelectedItems.Count == 0 ? null : aliasList.SelectedItems[0].Text; } }
         public int BudgetSeconds { get { return (int)budget.Value; } }
         public bool AliasesSelected { get { return tabs.SelectedIndex == 2; } }
+        public bool IndicatorEnabled { get { return indicatorEnabled.Checked; } }
+        public string IndicatorDisplay { get { return displays.SelectedItem as string; } }
+        public bool CautiousSearch { get { return cautiousSearch.Checked; } set { cautiousSearch.Checked = value; } }
+        public bool HotkeysEnabled { get { return hotkeysEnabled.Checked; } set { hotkeysEnabled.Checked = value; } }
         public int SelectedRehearsalSlideId
         {
             get { return rehearsalList.SelectedItems.Count == 0 ? 0 : (int)rehearsalList.SelectedItems[0].Tag; }
@@ -70,27 +85,42 @@ namespace JarvisPowerPoint
             var aliasesTab = new TabPage();
             tabs.TabPages.AddRange(new[] { statusTab, rehearsalTab, aliasesTab });
 
-            var main = new FlowLayoutPanel
+            var main = new TableLayoutPanel
             {
-                Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown,
-                WrapContents = false, AutoScroll = true, Padding = new Padding(12)
+                Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 0,
+                AutoScroll = true, Padding = new Padding(12)
             };
-            main.Controls.AddRange(new Control[] { presentation, status, audioLevel, heard, outcome });
+            main.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            foreach (Control control in new Control[] { presentation, status, audioLevel, heard, outcome })
+                UiAccessibility.AddRow(main, control);
             var commands = Row();
-            commands.Controls.Add(MakeButton("Écoute / pause", "Listen / pause", delegate { Raise(PauseRequested); }));
-            commands.Controls.Add(MakeButton("Réglages micro...", "Microphone setup...", delegate { Raise(SettingsRequested); }));
-            commands.Controls.Add(MakeButton("Mode questions", "Questions mode", delegate { Raise(QuestionsRequested); }));
-            commands.Controls.Add(MakeButton("Reprendre", "Resume", delegate { Raise(ResumeRequested); }));
-            commands.Controls.Add(MakeButton("Autre résultat", "Next match", delegate { Raise(NextResultRequested); }));
-            commands.Controls.Add(MakeButton("Écran noir", "Black screen", delegate { Raise(BlackRequested); }));
-            commands.Controls.Add(MakeButton("Afficher", "Restore slides", delegate { Raise(DisplayRequested); }));
-            main.Controls.Add(commands);
-            main.Controls.Add(indicatorEnabled);
-            main.Controls.Add(displays);
-            main.Controls.Add(privacy);
+            listenButton = MakeButton("&Écoute / pause", "&Listen / pause", delegate { Raise(PauseRequested); });
+            microphoneSetupButton = MakeButton("Réglages &micro...", "&Microphone setup...", delegate { Raise(SettingsRequested); });
+            commands.Controls.Add(listenButton);
+            commands.Controls.Add(microphoneSetupButton);
+            commands.Controls.Add(MakeButton("Mode &questions", "&Questions mode", delegate { Raise(QuestionsRequested); }));
+            commands.Controls.Add(MakeButton("&Reprendre", "&Resume", delegate { Raise(ResumeRequested); }));
+            commands.Controls.Add(MakeButton("&Autre résultat", "&Next match", delegate { Raise(NextResultRequested); }));
+            commands.Controls.Add(MakeButton("Écran &noir", "&Black screen", delegate { Raise(BlackRequested); }));
+            commands.Controls.Add(MakeButton("A&fficher", "Restore &slides", delegate { Raise(DisplayRequested); }));
+            UiAccessibility.AddRow(main, commands);
+            var utilities = Row();
+            utilities.Controls.Add(MakeButton("&Vérifier avant présentation", "Pre-presentation &check", delegate { Raise(PreflightRequested); }));
+            utilities.Controls.Add(MakeButton("&Parcours et historique...", "Routes and &history...", delegate { Raise(ProfilesRequested); }));
+            utilities.Controls.Add(MakeButton("&Diagnostic local...", "Local &diagnostics...", delegate { Raise(DiagnosticsRequested); }));
+            utilities.Controls.Add(MakeButton("Mises à &jour...", "&Updates...", delegate { Raise(UpdatesRequested); }));
+            UiAccessibility.AddRow(main, utilities);
+            UiAccessibility.AddRow(main, cautiousSearch);
+            UiAccessibility.AddRow(main, hotkeysEnabled);
+            cautiousSearch.CheckedChanged += delegate { Raise(CautiousSearchChanged); };
+            hotkeysEnabled.CheckedChanged += delegate { Raise(HotkeysChanged); };
+            UiAccessibility.AddRow(main, indicatorEnabled);
+            UiAccessibility.AddRow(main, displays);
+            UiAccessibility.AddRow(main, privacy);
             statusTab.Controls.Add(main);
 
-            var rehearsalTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 110, Padding = new Padding(8) };
+            var rehearsalTop = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8), TabIndex = 0 };
+            rehearsalList.TabIndex = 1;
             rehearsalTop.Controls.Add(budgetHelp);
             rehearsalTop.Controls.Add(budget);
             rehearsalTop.Controls.Add(MakeButton("Appliquer à la sélection", "Apply to selected slide", delegate { Raise(BudgetRequested); }));
@@ -99,16 +129,21 @@ namespace JarvisPowerPoint
             rehearsalTop.Controls.Add(startRehearsal);
             rehearsalTop.Controls.Add(stopRehearsal);
             rehearsalTop.Controls.Add(MakeButton("Exporter CSV...", "Export CSV...", delegate { Raise(ExportRehearsalRequested); }));
+            rehearsalTop.Controls.Add(MakeButton("Enregistrer le bilan", "Save rehearsal", delegate { Raise(SaveRehearsalRequested); }));
+            rehearsalTop.Controls.Add(MakeButton("Comparer...", "Compare...", delegate { Raise(ProfilesRequested); }));
             rehearsalTop.Controls.Add(rehearsalSummary);
+            rehearsalTop.SetFlowBreak(rehearsalSummary, true);
+            UiAccessibility.WrapLabel(rehearsalSummary, rehearsalTop);
             rehearsalList.Columns.Add("Slide", 65);
             rehearsalList.Columns.Add("Titre", 265);
             rehearsalList.Columns.Add("Temps", 90);
             rehearsalList.Columns.Add("Budget", 90);
             rehearsalList.Columns.Add("Dépassement", 100);
-            rehearsalTab.Controls.Add(rehearsalList);
-            rehearsalTab.Controls.Add(rehearsalTop);
+            UiAccessibility.ScrollableSection(rehearsalTab, rehearsalTop, rehearsalList, 160);
 
-            var aliasesTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 145, Padding = new Padding(8) };
+            var aliasesTop = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8), TabIndex = 0 };
+            aliasList.TabIndex = 1;
+            UiAccessibility.WrapLabel(aliasHelp, aliasesTop);
             aliasesTop.Controls.Add(aliasHelp);
             aliasesTop.SetFlowBreak(aliasHelp, true);
             aliasesTop.Controls.Add(aliasInput);
@@ -119,8 +154,7 @@ namespace JarvisPowerPoint
             aliasList.Columns.Add("Alias", 200);
             aliasList.Columns.Add("Slide", 65);
             aliasList.Columns.Add("Titre", 355);
-            aliasesTab.Controls.Add(aliasList);
-            aliasesTab.Controls.Add(aliasesTop);
+            UiAccessibility.ScrollableSection(aliasesTab, aliasesTop, aliasList, 160);
             tabs.SelectedIndexChanged += delegate { if (tabs.SelectedIndex == 2) { Raise(RefreshAliasesRequested); } };
 
             foreach (Screen screen in Screen.AllScreens) { displays.Items.Add(screen.DeviceName); }
@@ -132,11 +166,12 @@ namespace JarvisPowerPoint
                 if (args.CloseReason == CloseReason.UserClosing) { args.Cancel = true; Hide(); }
             };
             SetLanguage(useEnglish);
+            UiAccessibility.Initialize(this);
         }
 
         private static FlowLayoutPanel Row()
         {
-            return new FlowLayoutPanel { AutoSize = true, MaximumSize = new Size(640, 0), WrapContents = true };
+            return new FlowLayoutPanel { AutoSize = true, WrapContents = true };
         }
 
         private Button MakeButton(string french, string en, EventHandler action)
@@ -155,11 +190,17 @@ namespace JarvisPowerPoint
         public void SetLanguage(bool value)
         {
             english = value;
+            AccessibleName = english ? "Jarvis PowerPoint presenter" : "Présentateur Jarvis PowerPoint";
             tabs.TabPages[0].Text = english ? "Presenter" : "Présentateur";
             tabs.TabPages[1].Text = english ? "Rehearsal" : "Répétition";
             tabs.TabPages[2].Text = english ? "Slide aliases" : "Alias de slides";
-            foreach (var item in buttonTexts) { item.Key.Text = item.Value[english ? 1 : 0]; }
-            indicatorEnabled.Text = english ? "Show compact listening indicator on this screen:" : "Afficher l’indicateur compact sur cet écran :";
+            foreach (var item in buttonTexts) { UiAccessibility.Caption(item.Key, item.Value[english ? 1 : 0]); }
+            UiAccessibility.Caption(indicatorEnabled, english ? "Show compact listening &indicator on this screen:" : "Afficher l’&indicateur compact sur cet écran :");
+            UiAccessibility.Caption(cautiousSearch, english ? "Con&firm ambiguous search results before moving" : "&Confirmer les résultats ambigus avant de changer de slide");
+            UiAccessibility.Caption(hotkeysEnabled, english ? "Enable &keyboard fallback (Ctrl+Alt+Shift)" : "Ac&tiver les raccourcis de secours (Ctrl+Alt+Maj)");
+            tooltips.SetToolTip(hotkeysEnabled, english
+                ? "Right / Left: next / previous; Enter: resume; N: next match; B: black screen; S: restore."
+                : "Droite / Gauche : suivant / précédent ; Entrée : reprise ; N : autre résultat ; B : écran noir ; S : afficher.");
             privacy.Text = english
                 ? "This panel and indicator are visible on your screen. Select your presenter monitor. Share only the PowerPoint slide-show window, not your entire desktop."
                 : "Ce panneau et l’indicateur sont visibles à l’écran. Choisissez votre écran présentateur. Partagez uniquement la fenêtre du diaporama, pas tout le bureau.";
@@ -172,20 +213,41 @@ namespace JarvisPowerPoint
             rehearsalList.Columns[2].Text = english ? "Time" : "Temps";
             rehearsalList.Columns[4].Text = english ? "Over budget" : "Dépassement";
             tooltips.SetToolTip(budget, english ? "Default for a new rehearsal; apply to a selected row to customize." : "Budget par défaut d’une nouvelle répétition ; personnalisable sur une ligne sélectionnée.");
+            tabs.AccessibleName = english ? "Presenter tools" : "Outils du présentateur";
+            audioLevel.AccessibleName = english ? "Microphone input level" : "Niveau d’entrée du microphone";
+            displays.AccessibleName = english ? "Listening indicator screen" : "Écran de l’indicateur d’écoute";
+            aliasInput.AccessibleName = english ? "Alias for the current slide" : "Alias du slide courant";
+            aliasList.AccessibleName = english ? "Saved slide aliases" : "Alias de slides enregistrés";
+            rehearsalList.AccessibleName = english ? "Rehearsal slide timings" : "Durées des slides de la répétition";
+            budget.AccessibleName = budgetHelp.Text;
+            hotkeysEnabled.AccessibleDescription = tooltips.GetToolTip(hotkeysEnabled);
+            privacy.UseMnemonic = false;
+            indicator.SetLanguage(english);
         }
 
         public void SetPresentation(string text)
         {
-            presentation.Text = text;
+            text = text ?? string.Empty;
+            if (presentation.Text != text) presentation.Text = text;
         }
 
         public void SetStatus(string state, string recognized, string result, int level)
         {
-            status.Text = state;
-            heard.Text = (english ? "Heard: " : "Entendu : ") + recognized;
-            outcome.Text = (english ? "Result: " : "Résultat : ") + result;
-            audioLevel.Value = Math.Max(0, Math.Min(100, level));
+            state = state ?? string.Empty;
+            string heardText = (english ? "Heard: " : "Entendu : ") + recognized;
+            string outcomeText = (english ? "Result: " : "Résultat : ") + result;
+            int clampedLevel = Math.Max(0, Math.Min(100, level));
+            if (status.Text != state) status.Text = state;
+            if (heard.Text != heardText) heard.Text = heardText;
+            if (outcome.Text != outcomeText) outcome.Text = outcomeText;
+            if (audioLevel.Value != clampedLevel) audioLevel.Value = clampedLevel;
             indicator.UpdateText(state, heard.Text, outcome.Text, audioLevel.Value);
+        }
+
+        public void SetSpeechControlsEnabled(bool enabled)
+        {
+            if (listenButton.Enabled != enabled) listenButton.Enabled = enabled;
+            if (microphoneSetupButton.Enabled != enabled) microphoneSetupButton.Enabled = enabled;
         }
 
         public void SetAliases(IList<SlideAlias> aliases)
@@ -195,7 +257,8 @@ namespace JarvisPowerPoint
             aliasList.Items.Clear();
             foreach (SlideAlias alias in aliases)
             {
-                var item = new ListViewItem(new[] { alias.Name, alias.SlideNumber == 0 ? "?" : alias.SlideNumber.ToString(), alias.Title ?? string.Empty });
+                var item = new ListViewItem(new[] { alias.Name, alias.SlideNumber == 0 ? "?" : alias.SlideNumber.ToString(), alias.Title ?? string.Empty })
+                    { ToolTipText = alias.Name + " · " + alias.Title };
                 aliasList.Items.Add(item);
                 item.Selected = alias.Name == selected;
             }
@@ -215,8 +278,7 @@ namespace JarvisPowerPoint
                     entry.SlideNumber.ToString(), entry.Title ?? string.Empty,
                     FormatTime(entry.Seconds), FormatTime(entry.BudgetSeconds),
                     entry.OverBudget ? (english ? "Yes" : "Oui") : ""
-                }) { Tag = entry.SlideId };
-                if (entry.OverBudget) { item.ForeColor = Color.Firebrick; }
+                }) { Tag = entry.SlideId, ToolTipText = entry.Title ?? "" };
                 rehearsalList.Items.Add(item);
                 item.Selected = entry.SlideId == selected;
             }
@@ -227,7 +289,7 @@ namespace JarvisPowerPoint
             }
             rehearsalList.EndUpdate();
             rehearsalSummary.Text = (tracker.IsRunning ? (english ? "Running · " : "En cours · ") : (english ? "Stopped · " : "Arrêtée · "))
-                + FormatTime(tracker.TotalSeconds) + (english ? " total; black screen excluded" : " au total ; écran noir exclu");
+                + FormatTime(tracker.TotalSeconds) + (english ? " total; see saved runs in Routes and history" : " au total ; bilans dans Parcours et historique");
             startRehearsal.Enabled = !tracker.IsRunning;
             stopRehearsal.Enabled = tracker.IsRunning;
         }
@@ -255,7 +317,7 @@ namespace JarvisPowerPoint
 
     internal sealed class ListeningIndicator : Form
     {
-        private readonly Label text = new Label { Dock = DockStyle.Fill, Padding = new Padding(8) };
+        private readonly Label text = new Label { Dock = DockStyle.Fill, Padding = new Padding(8), AutoEllipsis = true, UseMnemonic = false };
         private readonly ProgressBar level = new ProgressBar { Dock = DockStyle.Bottom, Height = 8 };
         protected override bool ShowWithoutActivation { get { return true; } }
 
@@ -271,12 +333,21 @@ namespace JarvisPowerPoint
             Font = new Font("Segoe UI", 9);
             Controls.Add(text);
             Controls.Add(level);
+            UiAccessibility.Initialize(this);
         }
 
         public void UpdateText(string state, string heard, string outcome, int audioLevel)
         {
-            text.Text = state + "\n" + heard + "\n" + outcome;
-            level.Value = audioLevel;
+            string statusText = state + "\n" + heard + "\n" + outcome;
+            if (text.Text != statusText) text.Text = statusText;
+            if (text.AccessibleName != statusText) text.AccessibleName = statusText;
+            if (level.Value != audioLevel) level.Value = audioLevel;
+        }
+
+        public void SetLanguage(bool english)
+        {
+            AccessibleName = english ? "Compact listening indicator" : "Indicateur compact d’écoute";
+            level.AccessibleName = english ? "Microphone input level" : "Niveau d’entrée du microphone";
         }
     }
 }

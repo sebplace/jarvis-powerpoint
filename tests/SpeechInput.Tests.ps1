@@ -63,6 +63,11 @@ internal static class SpeechInputTestProgram
                 HardwareProbe();
                 return 0;
             }
+            if (args.Length == 2 && args[0] == "--cleanup-failure")
+            {
+                CleanupFailureStage(int.Parse(args[1]));
+                return 0;
+            }
             DeviceIdentity();
             ExpectedFailures();
             InputLevels();
@@ -73,12 +78,166 @@ internal static class SpeechInputTestProgram
             NativeLayouts();
             DialogWithoutCapture();
             EnumerateWithoutCapture();
+            ProcessCaptureSafety();
             Console.WriteLine("Passed " + assertions + " assertions; no microphone was opened.");
             Console.WriteLine("No-capture suite excludes live speech, unplug and driver lifecycle; "
                 + "-ProbeMicrophone additionally checks bounded capture/disposal/reopen.");
             return 0;
         }
         catch (Exception error) { Console.Error.WriteLine(error); return 1; }
+    }
+
+    private static void ProcessCaptureSafety()
+    {
+        Assert(!SpeechInput.CaptureBlocked, "Capture was blocked without a native ownership failure.");
+        SpeechInput.EnsureCaptureAvailable();
+        string cleanupOrder = "";
+        SpeechInputErrors.DisposeCapture(delegate { cleanupOrder += "input "; },
+            delegate { cleanupOrder += "cancel "; }, delegate { cleanupOrder += "recognizer"; });
+        Assert(cleanupOrder == "input cancel recognizer" && !SpeechInput.CaptureBlocked,
+            "Successful teardown reordered cleanup or blocked future capture.");
+        var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+        var inputFailure = new FailingInput();
+        Type sessionType = typeof(SetupDialog).GetNestedType("TestSession", BindingFlags.NonPublic);
+        object testSession = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(sessionType);
+        sessionType.GetField("input", flags).SetValue(testSession, inputFailure);
+        using (var dialog = new SetupDialog("en-US", "default", false))
+        {
+            MakeSelectionAvailable(dialog);
+            Field<CheckBox>(dialog, "skip").Checked = true;
+            Assert(Field<Button>(dialog, "test").Enabled && Field<Button>(dialog, "finish").Enabled,
+                "Synthetic available selection did not enable test and explicit skip/save.");
+            typeof(SetupDialog).GetField("tested", flags).SetValue(dialog, true);
+            typeof(SetupDialog).GetField("session", flags).SetValue(dialog, testSession);
+            typeof(SetupDialog).GetMethod("Finish", flags).Invoke(dialog, new object[] { null, EventArgs.Empty });
+            Assert(inputFailure.DisposeCount == 1 && Field<object>(dialog, "session") == null
+                && sessionType.GetField("input", flags).GetValue(testSession) == null,
+                "Failed cleanup retained or skipped a capture without a recognizer.");
+            Assert(SpeechInput.CaptureBlocked && !Field<Button>(dialog, "finish").Enabled
+                && !Field<Button>(dialog, "test").Enabled && dialog.DialogResult != DialogResult.OK,
+                "Cleanup during Finish saved settings or did not process-latch test/save.");
+            Assert(!Field<bool>(dialog, "tested") && Field<string>(dialog, "failure") != null,
+                "Failed teardown preserved a successful test or hid the failure.");
+            ((IDisposable)testSession).Dispose();
+            Assert(inputFailure.DisposeCount == 1, "Repeated test teardown disposed the retained input twice.");
+        }
+
+        var original = new Exception[] { new IOException("input"), new COMException("cancel"),
+            new InvalidOperationException("recognizer") };
+        cleanupOrder = "";
+        try
+        {
+            SpeechInputErrors.DisposeCapture(delegate { cleanupOrder += "input "; throw original[0]; },
+                delegate { cleanupOrder += "cancel "; throw original[1]; },
+                delegate { cleanupOrder += "recognizer"; throw original[2]; });
+            throw new Exception("Uncertain cleanup was not reported.");
+        }
+        catch (SpeechCleanupException error)
+        {
+            var failures = error.InnerException as AggregateException;
+            Assert(cleanupOrder == "input cancel recognizer" && failures != null
+                && failures.InnerExceptions.Count == 3, "Cleanup failure skipped teardown or lost an error.");
+            for (int i = 0; i < original.Length; i++)
+                Assert(object.ReferenceEquals(original[i], failures.InnerExceptions[i]),
+                    "Cleanup replaced an original exception.");
+        }
+        Exception firstFailure = (Exception)typeof(SpeechInput).GetField("captureFailure",
+            BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
+        typeof(SpeechInput).GetMethod("BlockCapture", BindingFlags.NonPublic | BindingFlags.Static)
+            .Invoke(null, new object[] { "Simulated unsafe ownership; no native calls." });
+        SpeechInputErrors.DisposeCapture(delegate { }, delegate { }, delegate { });
+        Assert(SpeechInput.CaptureBlocked, "Unsafe ownership did not latch across capture sessions.");
+        try
+        {
+            SpeechInput.EnsureCaptureAvailable();
+            throw new Exception("Unsafe ownership allowed another capture session.");
+        }
+        catch (IOException failure)
+        {
+            Assert(SpeechInputErrors.HasUnsafeCleanup(failure), "Process latch lost the unsafe ownership reason.");
+            Assert(object.ReferenceEquals(firstFailure, failure.InnerException),
+                "Later cleanup replaced the first unsafe ownership failure.");
+        }
+        foreach (string culture in new[] { "fr-FR", "en-US" })
+        {
+            using (var dialog = new SetupDialog(culture, "default", false))
+            {
+                MakeSelectionAvailable(dialog);
+                Field<CheckBox>(dialog, "skip").Checked = true;
+                typeof(SetupDialog).GetField("tested", flags).SetValue(dialog, true);
+                typeof(SetupDialog).GetMethod("PollTest", flags).Invoke(dialog, new object[] { null, EventArgs.Empty });
+                var test = (Control)typeof(SetupDialog).GetField("test", flags).GetValue(dialog);
+                var finish = (Control)typeof(SetupDialog).GetField("finish", flags).GetValue(dialog);
+                var notice = (Control)typeof(SetupDialog).GetField("availability", flags).GetValue(dialog);
+                Assert(!test.Enabled && !finish.Enabled, "Unsafe cleanup left setup actions enabled.");
+                Assert(notice.Text.Contains(culture == "fr-FR" ? "red\u00e9marrez" : "restart"),
+                    "Unsafe setup cleanup did not explain the manual restart requirement.");
+                Assert(Field<Label>(dialog, "status").Text == SpeechInput.RestartRequiredMessage(culture == "en-US"),
+                    "Test/skip success text hid the restart requirement.");
+                Assert(!Field<System.Windows.Forms.Timer>(dialog, "timer").Enabled,
+                    "Restart-required setup kept polling after capture became permanently blocked.");
+                typeof(SetupDialog).GetMethod("StartTest", flags).Invoke(dialog, null);
+                typeof(SetupDialog).GetMethod("Finish", flags).Invoke(dialog, new object[] { null, EventArgs.Empty });
+                Assert(Field<object>(dialog, "session") == null && dialog.DialogResult != DialogResult.OK,
+                    "Direct setup test/finish calls bypassed unsafe ownership.");
+                Field<ComboBox>(dialog, "languages").SelectedIndex = culture == "fr-FR" ? 1 : 0;
+                Field<CheckBox>(dialog, "skip").Checked = true;
+                Assert(!test.Enabled && !finish.Enabled && SpeechInput.CaptureBlocked,
+                    "Changing language or skipping the test cleared unsafe ownership.");
+                typeof(SetupDialog).GetMethod("LoadChoices", flags).Invoke(dialog, new object[] { "default" });
+                Assert(!test.Enabled && !finish.Enabled && SpeechInput.CaptureBlocked,
+                    "Refreshing setup cleared unsafe ownership.");
+            }
+        }
+        try
+        {
+            Activator.CreateInstance(sessionType, BindingFlags.Instance | BindingFlags.Public,
+                null, new object[] { null, "default" }, null);
+            throw new Exception("Test-session construction bypassed the process latch.");
+        }
+        catch (TargetInvocationException error)
+        {
+            Assert(SpeechInputErrors.HasUnsafeCleanup(error.InnerException),
+                "Test-session construction reached recognizer setup before checking ownership.");
+        }
+    }
+
+    private sealed class FailingInput : IDisposable
+    {
+        public int DisposeCount;
+        public void Dispose() { DisposeCount++; throw new IOException("Synthetic native ownership failure."); }
+    }
+
+    private static void CleanupFailureStage(int stage)
+    {
+        Assert(!SpeechInput.CaptureBlocked, "Isolated cleanup started blocked.");
+        int calls = 0;
+        var original = new IOException("Synthetic cleanup stage " + stage);
+        Action operation = delegate { if (calls++ == stage) throw original; };
+        try
+        {
+            SpeechInputErrors.DisposeCapture(operation, operation, operation);
+            throw new Exception("Isolated cleanup failure was hidden.");
+        }
+        catch (SpeechCleanupException error)
+        {
+            var errors = error.InnerException as AggregateException;
+            Assert(SpeechInput.CaptureBlocked && calls == 3, "Cleanup stage did not block capture or skipped later teardown.");
+            Assert(errors != null && errors.InnerExceptions.Count == 1
+                && object.ReferenceEquals(errors.InnerExceptions[0], original), "Cleanup lost its original failure.");
+        }
+        SpeechInputErrors.DisposeCapture(delegate { }, delegate { }, delegate { });
+        Throws<IOException>(SpeechInput.EnsureCaptureAvailable, "Successful later teardown cleared the safety latch.");
+        Console.WriteLine("Passed " + assertions + " isolated cleanup-stage " + stage + " assertions; no capture.");
+    }
+
+    private static void MakeSelectionAvailable(SetupDialog dialog)
+    {
+        Field<Dictionary<string, RecognizerInfo>>(dialog, "recognizers").Add("fr-FR", null);
+        Field<Dictionary<string, RecognizerInfo>>(dialog, "recognizers").Add("en-US", null);
+        typeof(SetupDialog).GetField("devices", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(dialog,
+            new List<AudioInputDevice> { new AudioInputDevice("default", "Default"),
+                new AudioInputDevice(SpeechInput.CreateDeviceId(0, "Synthetic", 0, 0), "Synthetic") });
     }
 
     private static void InputLevels()
@@ -114,6 +273,24 @@ internal static class SpeechInputTestProgram
         Throws<NullReferenceException>(delegate {
             SpeechInputErrors.CaptureExpectedFailure(delegate { throw new NullReferenceException(); });
         }, "Programming error was swallowed by an overly broad production catch.");
+        Assert(SpeechInputErrors.HasUnsafeCleanup(new IOException("attach",
+            new AggregateException(new IOException(), new SpeechCleanupException("busy driver")))),
+            "Nested native cleanup failure did not block automatic capture restart.");
+        Assert(!SpeechInputErrors.HasUnsafeCleanup(new IOException("unplug")),
+            "Ordinary disconnect was treated as unsafe native cleanup.");
+        Assert(!SpeechInputErrors.HasUnsafeCleanup(null), "Null cleanup failure was unsafe.");
+        try
+        {
+            SpeechInputErrors.CleanupPreservingFailure(
+                delegate { throw new SpeechCleanupException("driver retained native ownership"); },
+                new ArgumentException("SAPI rejected stream"));
+            throw new Exception("Unsafe cleanup after attach was hidden, allowing another capture.");
+        }
+        catch (IOException failure)
+        {
+            Assert(SpeechInputErrors.HasUnsafeCleanup(failure) && failure.InnerException is AggregateException,
+                "Unsafe attach cleanup lost either the original or cleanup failure.");
+        }
         var startup = new IOException("Original attach failure.");
         try
         {
@@ -517,10 +694,15 @@ try {
         "/out:$executable" /reference:System.dll /reference:System.Core.dll `
         /reference:System.Drawing.dll /reference:System.Windows.Forms.dll "/reference:$speech" `
         (Join-Path $projectDirectory "SpeechInput.cs") `
+        (Join-Path $projectDirectory "UiAccessibility.cs") `
         (Join-Path $projectDirectory "SetupDialog.cs") $source
     if ($LASTEXITCODE -ne 0) { throw "Speech input test compilation failed: $LASTEXITCODE" }
     & $executable
     if ($LASTEXITCODE -ne 0) { throw "Speech input tests failed: $LASTEXITCODE" }
+    foreach ($stage in 0..2) {
+        & $executable --cleanup-failure $stage
+        if ($LASTEXITCODE -ne 0) { throw "Speech cleanup stage $stage failed: $LASTEXITCODE" }
+    }
     if ($ProbeMicrophone) {
         $probe = New-Object Diagnostics.Process
         $probe.StartInfo.FileName = $executable

@@ -12,6 +12,8 @@ namespace JarvisPowerPoint
         public int SlideCount { get; set; }
         public string Title { get; set; }
         public bool IsBlack { get; set; }
+        public string SavedPath { get; set; }
+        public IntPtr WindowHandle { get; set; }
     }
 
     internal sealed class SlideAlias

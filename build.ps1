@@ -55,12 +55,14 @@ New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
     /target:winexe `
     /platform:anycpu `
     /optimize+ `
+    "/win32manifest:$projectDirectory\app.manifest" `
     "/out:$outputPath" `
     /reference:System.dll `
     /reference:System.Core.dll `
     /reference:System.Drawing.dll `
     /reference:System.Xml.dll `
     /reference:System.Xml.Linq.dll `
+    /reference:System.Runtime.Serialization.dll `
     "/reference:$speechAssembly" `
     /reference:System.Windows.Forms.dll `
     "/reference:$officeInterop" `

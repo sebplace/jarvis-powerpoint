@@ -24,10 +24,15 @@ namespace JarvisPowerPoint
         private int activeSlideId;
         private bool counting;
         private TimeSpan lastObservation;
+        private Dictionary<int, int> savedBudgets = new Dictionary<int, int>();
 
         public bool IsRunning { get; private set; }
         public int DefaultBudgetSeconds { get; set; }
         public string PresentationName { get; private set; }
+        public string SavedPath { get; private set; }
+        public string PresentationKey { get; private set; }
+        public string RunId { get; private set; }
+        public DateTime StartedUtc { get; private set; }
         public double TotalSeconds { get { return entries.Values.Sum(entry => entry.Seconds); } }
         public IList<RehearsalEntry> Entries
         {
@@ -41,11 +46,30 @@ namespace JarvisPowerPoint
 
         public void Start(PresentationSnapshot snapshot, TimeSpan now)
         {
+            Start(snapshot, now, null);
+        }
+
+        public void Start(PresentationSnapshot snapshot, TimeSpan now, IDictionary<int, int> budgets)
+        {
             if (snapshot == null) { throw new ArgumentNullException("snapshot"); }
             if (DefaultBudgetSeconds < 1) { throw new InvalidOperationException("The slide budget must be positive."); }
+            var validated = new Dictionary<int, int>();
+            if (budgets != null)
+            {
+                foreach (var entry in budgets)
+                {
+                    if (entry.Key <= 0 || entry.Value < 1 || entry.Value > 3600) { throw new ArgumentException("Invalid saved slide budget.", "budgets"); }
+                    validated.Add(entry.Key, entry.Value);
+                }
+            }
+            savedBudgets = validated;
             entries.Clear();
             sessionKey = snapshot.SessionKey;
             PresentationName = snapshot.PresentationName;
+            SavedPath = snapshot.SavedPath;
+            PresentationKey = snapshot.PresentationKey;
+            RunId = Guid.NewGuid().ToString("N");
+            StartedUtc = DateTime.UtcNow;
             lastObservation = now;
             activeSlideId = 0;
             counting = false;
@@ -67,7 +91,9 @@ namespace JarvisPowerPoint
             RehearsalEntry entry;
             if (!entries.TryGetValue(snapshot.SlideId, out entry))
             {
-                entry = new RehearsalEntry { SlideId = snapshot.SlideId, BudgetSeconds = DefaultBudgetSeconds };
+                int budget;
+                if (!savedBudgets.TryGetValue(snapshot.SlideId, out budget)) { budget = DefaultBudgetSeconds; }
+                entry = new RehearsalEntry { SlideId = snapshot.SlideId, BudgetSeconds = budget };
                 entries.Add(entry.SlideId, entry);
             }
             entry.SlideNumber = snapshot.SlideNumber;
@@ -89,6 +115,7 @@ namespace JarvisPowerPoint
             RehearsalEntry entry;
             if (!entries.TryGetValue(slideId, out entry)) { throw new InvalidOperationException("Select a recorded slide first."); }
             entry.BudgetSeconds = seconds;
+            savedBudgets[slideId] = seconds;
         }
 
         private void Accumulate(TimeSpan now)

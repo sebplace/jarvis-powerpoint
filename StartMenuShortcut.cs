@@ -36,6 +36,7 @@ namespace JarvisPowerPoint
 
         public ShortcutResult Configure(Func<bool> confirm, bool fromMenu)
         {
+            if (ManagedDeployment.IsManagedExecutable(executablePath)) return ShortcutResult.NotNeeded;
             if (!fromMenu)
             {
                 // Leave existing shortcuts alone; the menu can repair one after a move.
@@ -51,7 +52,9 @@ namespace JarvisPowerPoint
                 }
             }
 
-            if (!confirm())
+            bool accepted = confirm();
+            if (ManagedDeployment.IsManagedExecutable(executablePath)) return ShortcutResult.NotNeeded;
+            if (!accepted)
             {
                 RememberChoice();
                 return ShortcutResult.Declined;
